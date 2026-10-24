@@ -77,6 +77,45 @@ export function translateFromSVG(svg: SVGSVGElement, points: ArrayLike<number>):
     return output;
 }
 
+/** Insert a vertex on the nearest edge. Returns null when the click is not on an edge. */
+export function insertPointOnEdge(
+    points: number[],
+    x: number,
+    y: number,
+    maxDistance: number,
+    closed: boolean,
+): number[] | null {
+    const count = Math.floor(points.length / 2);
+    if (count < 2) return null;
+    const segments = closed ? count : count - 1;
+    let best: { index: number; x: number; y: number; distance: number } | null = null;
+    for (let i = 0; i < segments; i++) {
+        const j = (i + 1) % count;
+        const ax = points[i * 2];
+        const ay = points[i * 2 + 1];
+        const bx = points[j * 2];
+        const by = points[j * 2 + 1];
+        const dx = bx - ax;
+        const dy = by - ay;
+        const length2 = dx * dx + dy * dy;
+        if (length2 < 1) continue;
+        let t = ((x - ax) * dx + (y - ay) * dy) / length2;
+        t = Math.max(0, Math.min(1, t));
+        if (t < 0.08 || t > 0.92) continue;
+        const px = ax + t * dx;
+        const py = ay + t * dy;
+        const distance = Math.hypot(x - px, y - py);
+        if (distance > maxDistance) continue;
+        if (!best || distance < best.distance) {
+            best = { index: i, x: px, y: py, distance };
+        }
+    }
+    if (!best) return null;
+    const next = points.slice();
+    next.splice((best.index + 1) * 2, 0, best.x, best.y);
+    return next;
+}
+
 // Translate point array from the coordinate system of a client
 // to the canvas coordinate system
 export function translateToSVG(svg: SVGSVGElement, points: ArrayLike<number>): number[] {

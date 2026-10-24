@@ -36,7 +36,7 @@ import {
     imageDataToDataURL, RLEToImageData, stringifyPoints, imageDataToRLE,
     composeShapeDimensions, getRoundedRotation,
     clamp, validateUnionResult, processPolygonUnionResult,
-    applySnapToShapePoint, isPolygonSelfIntersecting,
+    applySnapToShapePoint, isPolygonSelfIntersecting, insertPointOnEdge,
 } from './shared';
 import {
     CanvasModel, Geometry, UpdateReasons, FrameZoom, ActiveElement,
@@ -3663,6 +3663,26 @@ export class CanvasViewImpl implements CanvasView, Listener {
             });
 
             showDirection();
+            if (state.shapeType === 'polygon' || state.shapeType === 'polyline') {
+                const insertVertex = (e: MouseEvent): void => {
+                    const target = e.target as Element | null;
+                    if (target && target.tagName && target.tagName.toLowerCase() === 'circle') return;
+                    const [x, y] = translateToSVG(this.content, [e.clientX, e.clientY]);
+                    const maxDistance = 16 / (this.geometry.scale || 1);
+                    const updated = insertPointOnEdge(
+                        this.translateToCanvas(state.points),
+                        x,
+                        y,
+                        maxDistance,
+                        state.shapeType === 'polygon',
+                    );
+                    if (!updated) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    this.onEditDone(state, this.translateFromCanvas(updated));
+                };
+                (shape as any).on('dblclick', insertVertex);
+            }
         } else {
             (shape as any).on('dblclick', (e: MouseEvent) => {
                 if (e.shiftKey) {

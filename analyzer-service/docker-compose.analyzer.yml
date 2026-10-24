@@ -1,0 +1,77 @@
+# Adds the Requirement Analyzer beside the running CVAT stack.
+# It uses its own Postgres and Redis. CVAT's database and Redis are not shared.
+# From the CVAT checkout, in PowerShell:
+#   cd "analyzer-service"
+#   copy .env.example .env
+#   docker compose -f docker-compose.analyzer.yml up -d --build
+
+name: requirement-analyzer
+
+services:
+  analyzer_db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: analyzer
+      POSTGRES_PASSWORD: analyzer
+      POSTGRES_DB: analyzer
+    volumes:
+      - analyzer_db:/var/lib/postgresql/data
+    networks:
+      - cvat
+
+  analyzer_redis:
+    image: redis:7.2.11-alpine
+    networks:
+      - cvat
+
+  analyzer:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://analyzer:analyzer@analyzer_db:5432/analyzer
+      REDIS_URL: redis://analyzer_redis:6379/0
+      CVAT_BASE_URL: http://cvat-server:8080
+      ANALYZER_WEBHOOK_URL: http://analyzer:8090/webhooks/cvat
+      ANALYZER_DATA_DIR: /data
+    ports:
+      - "8095:8090"
+    volumes:
+      - analyzer_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - analyzer_db
+      - analyzer_redis
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=cvat_cvat
+      - traefik.http.routers.analyzer.rule=Host(`localhost`) && PathPrefix(`/analyzer`)
+      - traefik.http.routers.analyzer.priority=200
+      - traefik.http.routers.analyzer.entrypoints=web
+      - traefik.http.middlewares.analyzer-strip.stripprefix.prefixes=/analyzer
+      - traefik.http.routers.analyzer.middlewares=analyzer-strip
+      - traefik.http.services.analyzer.loadbalancer.server.port=8090
+    networks:
+      - cvat
+
+  analyzer_worker:
+    build: .
+    command: celery -A app.worker.celery worker --beat --loglevel=INFO
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://analyzer:analyzer@analyzer_db:5432/analyzer
+      REDIS_URL: redis://analyzer_redis:6379/0
+      CVAT_BASE_URL: http://cvat-server:8080
+    depends_on:
+      - analyzer
+      - analyzer_redis
+    networks:
+      - cvat
+
+networks:
+  cvat:
+    external: true
+    name: cvat_cvat
+
+volumes:
+  analyzer_db:
+  analyzer_data:

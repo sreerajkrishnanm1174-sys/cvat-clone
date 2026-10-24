@@ -1,0 +1,17 @@
+metadata:
+  name: requirement-analyzer
+  namespace: cvat
+  annotations:
+    name: Requirement Analyzer
+    type: detector
+    spec: |
+      []
+spec:
+  runtime: python:3.10
+  handler: main:handler
+  eventTimeout: 120s
+  build:
+    directives:
+      preCopy:
+        - kind: ENV
+          value: ANALYZER_URL=http://analyzer:8090
