@@ -96,31 +96,74 @@
   }
 
   function ensureStyle() {
-    if (document.getElementById("ra-style")) return;
-    var style = document.createElement("style");
-    style.id = "ra-style";
+    var style = document.getElementById("ra-style");
+    if (!style) {
+      style = document.createElement("style");
+      style.id = "ra-style";
+      document.head.appendChild(style);
+    }
     style.textContent = [
       "#ra-header-button{margin-left:8px;height:32px;padding:0 12px;border:1px solid #d9d9d9;border-radius:6px;background:#fff;color:#1f1f1f;font:500 13px/30px sans-serif;cursor:pointer}",
       "#ra-header-button:hover{border-color:#1677ff;color:#1677ff}",
-      "#ra-drawer{position:fixed;top:0;right:0;bottom:0;width:420px;max-width:100vw;background:#fff;border-left:1px solid #f0f0f0;box-shadow:-8px 0 24px rgba(0,0,0,.08);z-index:10020;display:none;font:14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;color:#1f1f1f}",
-      "#ra-drawer.is-open{display:flex;flex-direction:column}",
-      "#ra-drawer header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid #f0f0f0}",
-      "#ra-drawer h2{margin:0;font-size:16px;font-weight:650}",
-      "#ra-drawer header p{margin:4px 0 0;color:#667085;font-size:12px}",
-      "#ra-close{border:0;background:#f5f5f5;width:32px;height:32px;border-radius:6px;font-size:20px;line-height:1;cursor:pointer;color:#1f1f1f;flex:none}",
-      "#ra-body{overflow:auto;padding:16px 18px 24px}",
-      ".ra-card{border:1px solid #f0f0f0;border-radius:10px;padding:14px;margin:0 0 12px;background:#fff}",
+      "#ra-drawer{position:fixed;top:0;right:0;bottom:0;width:min(480px,100vw);background:#fff;border-left:1px solid #e6e8ec;box-shadow:-12px 0 40px rgba(16,24,40,.12);z-index:10020;display:none;font:14px/1.45 Segoe UI,Helvetica Neue,Arial,sans-serif;color:#1f2430}",
+      "#ra-drawer.is-open{display:flex;flex-direction:column;overflow:hidden}",
+      "#ra-drawer.is-open > *{flex:none;min-width:0}",
+      "#ra-drawer header{display:flex;flex-direction:row;flex-wrap:nowrap;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;border-bottom:1px solid #eef0f3;background:#fff}",
+      "#ra-drawer h2{flex:1 1 auto;min-width:0;margin:0;font-size:16px;font-weight:650;letter-spacing:-.02em;color:#101828;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      "#ra-drawer #ra-head-actions{display:flex !important;flex-direction:row !important;flex-wrap:nowrap !important;align-items:center !important;gap:12px !important;flex:none}",
+      "#ra-q-tools{display:inline-flex;align-items:center;justify-content:center;flex:none;height:34px;margin:0 !important;border:1px solid #d0d5dd;background:#fff;border-radius:8px;padding:0 12px;font-size:13px;font-weight:600;line-height:1;cursor:pointer;color:#344054}",
+      "#ra-q-tools:hover{border-color:#1890ff;color:#1890ff}",
+      "#ra-q-tools[aria-pressed='true']{background:#e8f3ff;border-color:#1890ff;color:#1890ff}",
+      "#ra-close{display:inline-flex;align-items:center;justify-content:center;border:1px solid #e6e8ec;background:#fff;width:34px;height:34px;margin:0 0 0 16px !important;padding:0;border-radius:8px;font-size:18px;line-height:1;cursor:pointer;color:#475467;flex:none}",
+      "#ra-close:hover{background:#f6f7f9;color:#101828}",
+      "#ra-context{margin:0;padding:8px 14px;border-bottom:1px solid #eef0f3;background:#fafbfc}",
+      "#ra-context-chip{display:inline-flex;max-width:100%;align-items:center;gap:6px;border:1px solid #e6e8ec;background:#fff;border-radius:99px;padding:6px 10px;font-size:12px;color:#344054}",
+      "#ra-body{display:none}",
+      "#ra-drawer.is-open > #ra-thread{flex:1 1 auto;min-height:0;overflow:auto;padding:16px 14px;background:#f7f8fa;display:flex;flex-direction:column;gap:10px}",
+      ".ra-bubble{max-width:88%;padding:10px 12px;border-radius:14px;white-space:pre-wrap;word-break:break-word}",
+      ".ra-bubble.agent{align-self:flex-start;background:#fff;border:1px solid #e6e8ec;border-bottom-left-radius:4px}",
+      ".ra-bubble.you{align-self:flex-end;background:#e8f3ff;border-bottom-right-radius:4px}",
+      ".ra-bubble.pending{color:#667085;font-style:italic}",
+      "#ra-quick{display:flex;flex-wrap:wrap;gap:8px;padding:10px 14px;border-top:1px solid #eef0f3;background:#fff}",
+      "#ra-quick button{flex:0 0 auto;height:36px;line-height:34px;border:1px solid #e6e8ec;background:#fff;border-radius:99px;padding:0 12px;font-size:12px;cursor:pointer;color:#1f2430}",
+      "#ra-quick button:hover{border-color:#1890ff;color:#1890ff}",
+      "#ra-composer{display:flex;flex-direction:column;gap:8px;padding:10px 14px 14px;border-top:1px solid #eef0f3;background:#fff}",
+      "#ra-compose-row{display:flex;gap:8px;align-items:flex-end;width:100%}",
+      "#ra-text{flex:1 1 auto;min-width:0;width:auto;min-height:44px;max-height:120px;border:1px solid #d9d9d9;border-radius:12px;padding:10px 12px;font:inherit;resize:none;background:#fff}",
+      ".ra-attach{position:relative;display:inline-flex;align-items:center;height:36px;padding:0 12px;border:1px solid #d9d9d9;border-radius:99px;background:#fff;font-size:12px;cursor:pointer;overflow:hidden;max-width:100%}",
+      ".ra-attach span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      "#ra-files{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;font-size:16px}",
+      "#ra-send{flex:none;height:44px;min-width:72px;border:0;border-radius:12px;background:#1890ff;color:#fff;font-weight:650;cursor:pointer}",
+      "#ra-send:disabled{opacity:.55;cursor:default}",
+      "#ra-tools{position:absolute;inset:0;z-index:6;display:flex;flex-direction:column;max-height:none;padding:0;overflow:hidden;background:#f6f7f9}",
+      "#ra-tools[hidden]{display:none !important}",
+      "#ra-tools-bar{display:flex;align-items:center;justify-content:space-between;gap:8px;flex:none;padding:12px 14px;background:#fff;border-bottom:1px solid #eef0f3}",
+      "#ra-tools-bar strong{font-size:15px}",
+      "#ra-tools-scroll{flex:1;min-height:0;overflow:auto;padding:12px}",
+      "#ra-tools .ra-card{border:1px solid #e6e8ec;border-radius:12px;padding:14px;margin:0 0 12px;background:#fff;box-shadow:0 1px 2px rgba(16,24,40,.04)}",
+      "#ra-tools .ra-card-head{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:36px;margin:0 0 8px}",
+      "#ra-tools .ra-card-head h3{margin:0;font-size:15px;line-height:36px;font-weight:650}",
+      "#ra-tools .ra-card-head .ra-btn{width:auto;height:36px;padding:0 12px;white-space:nowrap}",
+      "#ra-tools .ra-field{display:flex;flex-direction:column;align-items:stretch;gap:8px;margin-top:4px}",
+      "#ra-tools input[type=text],#ra-tools select{display:block;width:100%;height:40px;box-sizing:border-box;margin:0;border:1px solid #d0d5dd;border-radius:8px;padding:0 12px;font:inherit;background:#fff;color:#1f2430}",
+      "#ra-tools .ra-file{position:relative;display:flex;align-items:center;width:100%;height:40px;box-sizing:border-box;margin:0;padding:0 12px;border:1px solid #d0d5dd;border-radius:8px;background:#fff;cursor:pointer;overflow:hidden}",
+      "#ra-tools .ra-file span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      "#ra-tools .ra-file input{position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;cursor:pointer}",
+      "#ra-tools .ra-field > .ra-btn.primary{width:100%;height:40px;margin:0}",
+      "#ra-tools .ra-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}",
+      "#ra-tools .ra-actions .ra-btn,#ra-tools .ra-actions .ra-file{width:auto;height:36px;flex:0 0 auto}",
+      "#ra-tools .ra-split{display:grid;grid-template-columns:1fr 1fr;gap:8px;width:100%}",
+      "#ra-tools .ra-split .ra-btn{width:100%;height:40px}",
+      "#ra-tools .ra-split .wide{grid-column:1 / -1}",
       ".ra-card h3{margin:0 0 6px;font-size:13px;font-weight:650}",
-      ".ra-muted{color:#667085;font-size:12px;margin:0 0 10px}",
-      ".ra-row{display:flex;flex-wrap:wrap;gap:8px}",
-      ".ra-btn{border:1px solid #d9d9d9;background:#fff;border-radius:6px;padding:7px 10px;font-size:13px;cursor:pointer}",
-      ".ra-btn.primary{background:#1677ff;border-color:#1677ff;color:#fff}",
+      ".ra-muted{color:#667085;font-size:12px;margin:0 0 10px;line-height:1.4}",
+      ".ra-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}",
+      ".ra-btn{border:1px solid #d0d5dd;background:#fff;border-radius:8px;padding:0 12px;height:36px;font-size:13px;cursor:pointer;color:#1f2430}",
+      ".ra-btn.primary{background:#1890ff;border-color:#1890ff;color:#fff}",
       ".ra-btn:disabled{opacity:.55;cursor:default}",
       ".ra-chip{display:inline-block;margin:0 6px 6px 0;padding:2px 8px;border-radius:99px;background:#f5f5f5;font-size:12px}",
       ".ra-status{margin-top:8px;padding:8px 10px;border-radius:8px;background:#f6f8fa;font-size:12px;white-space:pre-wrap}",
-      "#ra-log{max-height:180px;overflow:auto;background:#fafafa;border-radius:8px;padding:8px;margin-bottom:8px}",
-      "#ra-log div{margin:0 0 8px;white-space:pre-wrap}",
-      "#ra-text{width:100%;box-sizing:border-box;border:1px solid #d9d9d9;border-radius:6px;padding:8px;font:inherit;resize:vertical}",
+      "#ra-log{display:contents}",
       "#ra-dashboard,#ra-task-banner{margin:12px 16px 0;padding:14px 16px;border:1px solid #d6e4ff;border-radius:10px;background:linear-gradient(180deg,#f5f8ff,#fff)}",
       "#ra-dashboard h3,#ra-task-banner h3{margin:0 0 4px;font-size:15px}",
       "#ra-sidebar-button{width:32px;height:32px;margin:4px auto;display:flex;align-items:center;justify-content:center;border:1px solid #d6e4ff;border-radius:6px;background:#f5f8ff;color:#1677ff;cursor:pointer}",
@@ -129,7 +172,8 @@
       "#ra-image-dialog .ra-dialog-card{width:420px;max-width:92vw;background:#fff;border-radius:10px;padding:16px;box-shadow:0 12px 40px rgba(0,0,0,.2)}",
       "#ra-dialog-images{width:100%;box-sizing:border-box;margin:0 0 12px}",
       ".ra-ai-option{display:block;width:100%;margin-top:10px;text-align:left}",
-      ".ra-switch{display:flex;align-items:center;gap:8px;font-size:13px}",
+      "#ra-tools .ra-switch{display:flex;align-items:center;gap:8px;min-height:40px;margin:8px 0 0;padding:0 12px;border:1px solid #e6e8ec;border-radius:8px;background:#fafbfc;font-size:13px}",
+      "#ra-tools .ra-switch input{width:16px;height:16px;margin:0;flex:none}",
       ".ra-decision{border-top:1px solid #f0f0f0;padding:8px 0}",
       ".ra-decision p{margin:4px 0;font-size:12px}",
       ".ra-decision strong{font-size:13px}",
@@ -140,6 +184,11 @@
       "#ra-new-name,#ra-task-name,#ra-task-choose,#ra-task-images{width:100%;box-sizing:border-box;border:1px solid #d9d9d9;border-radius:6px;padding:7px 8px;margin:0 0 8px;font:inherit;background:#fff}",
       "#ra-new{margin-top:8px}",
       "#ra-export-note{position:fixed;right:16px;bottom:16px;z-index:10001;max-width:320px;padding:10px 12px;border-radius:8px;background:#17324d;color:#fff;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.18)}",
+      "#ra-learn-badge{height:32px;margin:0 8px 0 0;padding:0 12px;border:1px solid #d6e4ff;border-radius:99px;background:#f5f8ff;color:#17324d;font:600 12px/30px sans-serif;cursor:pointer;white-space:nowrap}",
+      "#ra-learn-badge.is-running{animation:ra-pulse 1s ease-in-out infinite}",
+      "@keyframes ra-pulse{50%{opacity:.45}}",
+      "#ra-learn-panel{position:fixed;top:56px;right:16px;z-index:10020;width:340px;max-width:92vw;background:#fff;border:1px solid #d6e4ff;border-radius:10px;padding:12px;box-shadow:0 8px 24px rgba(0,0,0,.12)}",
+      ".ra-requirement-export{margin-top:12px;padding-top:12px;border-top:1px solid #f0f0f0}",
     ].join("");
     document.head.appendChild(style);
   }
@@ -152,14 +201,34 @@
     panel.id = "ra-drawer";
     panel.classList.remove("is-open");
     panel.innerHTML = [
-      "<header><div><h2>Requirement agent</h2><p id='ra-context'>Learning stays inside one project.</p></div><button id='ra-close' type='button' aria-label='Close'>&times;</button></header>",
-      "<div id='ra-body'>",
-      "<section class='ra-card'><div class='ra-row' style='justify-content:space-between;align-items:center'><h3 style='margin:0'>Projects</h3><button class='ra-btn' id='ra-new-toggle' type='button'>New project</button></div><p class='ra-muted' id='ra-list-copy' style='margin-top:8px'>Loading your projects…</p><div id='ra-project-list'></div><div id='ra-new' hidden><input id='ra-new-name' type='text' placeholder='Project name'/><label class='ra-btn'>Requirement document<input id='ra-new-file' type='file' accept='.pdf,.docx,.txt,.md' hidden/></label><div class='ra-row' style='margin-top:8px'><button class='ra-btn primary' id='ra-new-create' type='button'>Create project</button></div><div class='ra-status' id='ra-new-status' hidden></div></div></section>",
-      "<section class='ra-card' id='ra-detail'><h3>This project</h3><p class='ra-muted' id='ra-project-copy'>Select a project. The agent reads its requirement and explains the tool, the drawing method, and the decision for each label.</p><div id='ra-labels'></div><div id='ra-guide'></div><div id='ra-tasks'></div><p class='ra-muted' id='ra-learning'></p><p class='ra-muted'>Corrections are learned automatically when annotations in this project are saved.</p><label class='ra-switch'><input id='ra-learn' type='checkbox'/> Learn from this project's corrections</label></section>",
-      "<section class='ra-card'><h3>Requirement</h3><p class='ra-muted'>After the document is read, the agent decides what this project needs: boxes, polygons, masks, polylines, points, ellipses, cuboids, tags, a human skeleton, or tracking across frames.</p><div class='ra-row'><label class='ra-btn'>Upload requirement<input id='ra-file' type='file' accept='.pdf,.docx,.txt,.md' hidden/></label><button class='ra-btn' id='ra-analyze' type='button'>Analyze requirement</button><button class='ra-btn' id='ra-apply' type='button'>Apply labels</button></div><div class='ra-status' id='ra-req-status' hidden></div></section>",
-      "<section class='ra-card'><h3>Task in this project</h3><p class='ra-muted'>Choose the images, then create the task. Auto-annotation starts only after CVAT has imported those images into the task.</p><input id='ra-task-name' type='text' placeholder='Task name'/><input id='ra-task-images' type='file' accept='image/*,.zip,.jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff' multiple/><p class='ra-muted' id='ra-task-file-note'>No images chosen.</p><div class='ra-row'><button class='ra-btn primary' id='ra-task-create' type='button'>Create task</button></div><div class='ra-status' id='ra-task-status' hidden></div><p class='ra-muted' style='margin-top:10px'>Choose a task in this project and open it in the annotation tool.</p><select id='ra-task-choose'><option value=''>No task selected</option></select><div class='ra-row'><button class='ra-btn primary' id='ra-open-tool' type='button'>Open in tool</button><button class='ra-btn' id='ra-annotate' type='button'>Annotate this task</button><button class='ra-btn' id='ra-sync' type='button'>Learn from my corrections</button></div><p class='ra-muted' style='margin-top:10px'>Add images to the selected task. Add keeps the current images. Replace removes them.</p><input id='ra-more-images' type='file' accept='image/*,.zip,.jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff' multiple/><p class='ra-muted' id='ra-more-note'>No images chosen.</p><div class='ra-row'><button class='ra-btn primary' id='ra-images-add' type='button'>Add to current images</button><button class='ra-btn' id='ra-images-replace' type='button'>Replace current images</button></div></section>",
-      "<section class='ra-card'><h3>Ask the agent</h3><p class='ra-muted'>Ask it to correct labels, the requirement, tasks, or images. It can create, change, and delete them in this project.</p><div id='ra-log'></div><input id='ra-files' type='file' multiple/><textarea id='ra-text' rows='3' placeholder='Remove the standing label and keep person. Add these images to the current task.'></textarea><div class='ra-row' style='margin-top:8px'><button class='ra-btn primary' id='ra-send' type='button'>Send</button><button class='ra-btn' id='ra-clear' type='button'>Clear chat</button></div></section>",
+      "<header><h2>Annotation Agent</h2><div class='ra-head-actions'><button type='button' id='ra-q-tools' aria-pressed='false'>Project setup</button><button id='ra-close' type='button' aria-label='Close the agent'>&times;</button></div></header>",
+      "<p id='ra-context'><span id='ra-context-chip'>No project selected</span></p>",
+      "<div id='ra-thread' role='log' aria-live='polite' aria-relevant='additions'><div id='ra-log'></div></div>",
+      "<div id='ra-quick' aria-label='Quick actions'>",
+      "<button type='button' id='ra-q-analyze'>Analyze requirement</button>",
+      "<button type='button' id='ra-q-annotate'>Auto-annotate</button>",
+      "<button type='button' id='ra-q-learn'>What did you learn?</button>",
+      "<button type='button' id='ra-q-export'>Export</button>",
+      "<button type='button' id='ra-clear'>Clear chat</button>",
       "</div>",
+      "<form id='ra-composer' aria-label='Message the agent'>",
+      "<label class='ra-attach'>",
+      "<span id='ra-attach-label'>Attach files</span>",
+      "<input id='ra-files' type='file' multiple aria-label='Attach files'/>",
+      "</label>",
+      "<div id='ra-compose-row'>",
+      "<textarea id='ra-text' rows='1' placeholder='Ask about this project, or tell the agent what to change' aria-label='Message'></textarea>",
+      "<button id='ra-send' type='button'>Send</button>",
+      "</div>",
+      "</form>",
+      "<div id='ra-tools' hidden>",
+      "<div id='ra-tools-bar'><strong>Project setup</strong><button class='ra-btn' id='ra-tools-close' type='button'>Close</button></div>",
+      "<div id='ra-tools-scroll'>",
+      "<section class='ra-card'><div class='ra-card-head'><h3>Projects</h3><button class='ra-btn' id='ra-new-toggle' type='button'>New project</button></div><p class='ra-muted' id='ra-list-copy'>Loading your projects…</p><div id='ra-project-list'></div><div id='ra-new' class='ra-field' hidden><input id='ra-new-name' type='text' placeholder='Project name' aria-label='Project name'/><label class='ra-file'><span id='ra-new-file-label'>Requirement document</span><input id='ra-new-file' type='file' accept='.pdf,.docx,.txt,.md'/></label><button class='ra-btn primary' id='ra-new-create' type='button'>Create project</button><div class='ra-status' id='ra-new-status' hidden></div></div></section>",
+      "<section class='ra-card' id='ra-detail'><div class='ra-card-head'><h3>This project</h3></div><p class='ra-muted' id='ra-project-copy'>Select a project. The agent reads its requirement and explains the tool, the drawing method, and the decision for each label.</p><div id='ra-labels'></div><div id='ra-guide'></div><div id='ra-tasks'></div><p class='ra-muted' id='ra-learning'></p><label class='ra-switch'><input id='ra-learn' type='checkbox'/> Learn from this project's corrections</label></section>",
+      "<section class='ra-card'><div class='ra-card-head'><h3>Requirement</h3></div><p class='ra-muted'>Upload the client document. The agent reads it and sets up the labels for this project.</p><div class='ra-actions'><label class='ra-file'><span>Upload requirement</span><input id='ra-file' type='file' accept='.pdf,.docx,.txt,.md'/></label><button class='ra-btn' id='ra-analyze' type='button'>Analyze requirement</button><button class='ra-btn' id='ra-apply' type='button'>Apply labels</button></div><div class='ra-status' id='ra-req-status' hidden></div></section>",
+      "<section class='ra-card'><div class='ra-card-head'><h3>Task in this project</h3></div><p class='ra-muted'>Choose the images, then create the task. Auto-annotation starts only after CVAT has imported those images.</p><div class='ra-field'><input id='ra-task-name' type='text' placeholder='Task name' aria-label='Task name'/><label class='ra-file'><span id='ra-task-file-label'>Choose images</span><input id='ra-task-images' type='file' accept='image/*,.zip,.jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff' multiple/></label><p class='ra-muted' id='ra-task-file-note' hidden>No images chosen.</p><button class='ra-btn primary' id='ra-task-create' type='button'>Create task</button><div class='ra-status' id='ra-task-status' hidden></div><select id='ra-task-choose' aria-label='Choose a task'><option value=''>No task selected</option></select><div class='ra-split'><button class='ra-btn primary' id='ra-open-tool' type='button'>Open in tool</button><button class='ra-btn' id='ra-annotate' type='button'>Annotate this task</button><button class='ra-btn wide' id='ra-sync' type='button'>Learn from my corrections</button></div><p class='ra-muted'>Add keeps the current images. Replace removes them.</p><label class='ra-file'><span id='ra-more-file-label'>Images to add or replace</span><input id='ra-more-images' type='file' accept='image/*,.zip,.jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff' multiple/></label><p class='ra-muted' id='ra-more-note' hidden>No images chosen.</p><div class='ra-split'><button class='ra-btn primary' id='ra-images-add' type='button'>Add to current images</button><button class='ra-btn' id='ra-images-replace' type='button'>Replace current images</button></div></div></section>",
+      "</div></div>",
     ].join("");
     document.body.appendChild(panel);
     panel.querySelector("#ra-close").onclick = function (event) {
@@ -171,12 +240,14 @@
     panel.querySelector("#ra-analyze").onclick = onAnalyze;
     panel.querySelector("#ra-apply").onclick = onApply;
     panel.querySelector("#ra-task-images").onchange = function (event) {
-      var note = document.getElementById("ra-task-file-note");
       var files = event.target.files ? Array.prototype.slice.call(event.target.files) : [];
-      if (!note) return;
-      note.textContent = files.length
-        ? files.length + " file(s) chosen: " + files.slice(0, 4).map(function (file) { return file.name; }).join(", ")
-        : "No images chosen.";
+      var label = document.getElementById("ra-task-file-label");
+      var note = document.getElementById("ra-task-file-note");
+      var text = files.length
+        ? files.length + " file(s): " + files.slice(0, 3).map(function (file) { return file.name; }).join(", ")
+        : "Choose images";
+      if (label) label.textContent = text;
+      if (note) note.textContent = text;
     };
     panel.querySelector("#ra-task-create").onclick = createTaskInProject;
     panel.querySelector("#ra-task-choose").onchange = function (event) {
@@ -184,12 +255,14 @@
       chooseTask(Number(event.target.value) || null, option ? option.textContent : "");
     };
     panel.querySelector("#ra-more-images").onchange = function (event) {
-      var note = document.getElementById("ra-more-note");
       var files = event.target.files ? Array.prototype.slice.call(event.target.files) : [];
-      if (!note) return;
-      note.textContent = files.length
-        ? files.length + " file(s) chosen: " + files.slice(0, 4).map(function (file) { return file.name; }).join(", ")
-        : "No images chosen.";
+      var label = document.getElementById("ra-more-file-label");
+      var note = document.getElementById("ra-more-note");
+      var text = files.length
+        ? files.length + " file(s): " + files.slice(0, 3).map(function (file) { return file.name; }).join(", ")
+        : "Images to add or replace";
+      if (label) label.textContent = text;
+      if (note) note.textContent = text;
     };
     panel.querySelector("#ra-images-add").onclick = function () { updateTaskImages("add"); };
     panel.querySelector("#ra-images-replace").onclick = function () { updateTaskImages("replace"); };
@@ -197,12 +270,48 @@
     panel.querySelector("#ra-annotate").onclick = onAnnotate;
     panel.querySelector("#ra-sync").onclick = onSync;
     panel.querySelector("#ra-learn").onchange = onLearnToggle;
+    panel.querySelector("#ra-composer").addEventListener("submit", function (event) { event.preventDefault(); onSend(); });
+    panel.querySelector("#ra-files").addEventListener("change", function () {
+      var label = document.getElementById("ra-attach-label");
+      var chosen = this.files ? Array.prototype.slice.call(this.files) : [];
+      if (label) label.textContent = chosen.length ? chosen.map(function (file) { return file.name; }).join(", ") : "Attach files";
+    });
     panel.querySelector("#ra-send").onclick = onSend;
     panel.querySelector("#ra-clear").onclick = clearChat;
+    panel.querySelector("#ra-text").addEventListener("keydown", function (event) {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        onSend();
+      }
+    });
+    panel.querySelector("#ra-q-analyze").onclick = function () { showTools(); document.getElementById("ra-analyze").click(); };
+    panel.querySelector("#ra-q-annotate").onclick = function () { document.getElementById("ra-annotate").click(); };
+    panel.querySelector("#ra-q-learn").onclick = function () { showTools(); document.getElementById("ra-sync").click(); };
+    panel.querySelector("#ra-q-export").onclick = function () {
+      if (!view.projectId) { exportNote("Open a project before exporting its requirement format."); return; }
+      var taskId = view.taskId;
+      downloadRequirementExport(taskId ? "tasks" : "projects", taskId || view.projectId);
+    };
+    function setToolsOpen(open) {
+      var tools = document.getElementById("ra-tools");
+      var button = document.getElementById("ra-q-tools");
+      if (tools) tools.hidden = !open;
+      if (button) button.setAttribute("aria-pressed", String(!!open));
+    }
+    panel.querySelector("#ra-q-tools").onclick = function () {
+      var tools = document.getElementById("ra-tools");
+      setToolsOpen(tools.hidden);
+    };
+    panel.querySelector("#ra-tools-close").onclick = function () { setToolsOpen(false); };
     panel.querySelector("#ra-new-toggle").onclick = function () {
       var box = document.getElementById("ra-new");
       box.hidden = !box.hidden;
     };
+    panel.querySelector("#ra-new-file").addEventListener("change", function () {
+      var label = document.getElementById("ra-new-file-label");
+      var file = this.files && this.files[0];
+      if (label) label.textContent = file ? file.name : "Requirement document";
+    });
     panel.querySelector("#ra-new-create").onclick = createProject;
     paintLog();
     return panel;
@@ -217,16 +326,48 @@
     if (id === "ra-task-status") exportNote(text || "");
   }
 
+  function setContext() {
+    var chip = document.getElementById("ra-context-chip");
+    if (!chip) return;
+    var parts = [];
+    if (view.projectName || view.projectId) parts.push(view.projectName || ("Project " + view.projectId));
+    if (view.taskId) parts.push("Task " + view.taskId + (view.taskName ? " " + view.taskName : ""));
+    chip.textContent = parts.length ? parts.join(" · ") : "No project selected. Open Project setup to choose one.";
+  }
+
+  function showTools() {
+    var tools = document.getElementById("ra-tools");
+    var button = document.getElementById("ra-q-tools");
+    if (tools) tools.hidden = false;
+    if (button) button.setAttribute("aria-pressed", "true");
+  }
+
+  var agentBusy = false;
+
   function paintLog() {
     var log = document.getElementById("ra-log");
+    var thread = document.getElementById("ra-thread");
     if (!log) return;
     log.innerHTML = "";
-    history.slice(-8).forEach(function (item) {
+    if (!history.length && !agentBusy) {
+      var hello = document.createElement("div");
+      hello.className = "ra-bubble agent";
+      hello.textContent = "Upload the client requirement and I will set up the labels. You can also ask me to create a task, annotate images, or fix a label. I only change this project.";
+      log.appendChild(hello);
+    }
+    history.slice(-20).forEach(function (item) {
       var row = document.createElement("div");
-      row.textContent = (item.role === "user" ? "You" : "Agent") + ": " + String(item.content || "").replace(/\*\*/g, "").replace(/`/g, "");
+      row.className = "ra-bubble " + (item.role === "user" ? "you" : "agent");
+      row.textContent = String(item.content || "").replace(/\*\*/g, "").replace(/`/g, "");
       log.appendChild(row);
     });
-    log.scrollTop = log.scrollHeight;
+    if (agentBusy) {
+      var wait = document.createElement("div");
+      wait.className = "ra-bubble agent pending";
+      wait.textContent = "Working on that…";
+      log.appendChild(wait);
+    }
+    if (thread) thread.scrollTop = thread.scrollHeight;
   }
 
   function renderProject(spec, learning) {
@@ -408,8 +549,7 @@
     view.projectName = name || "";
     view.taskId = null;
     view.taskName = "";
-    var context = document.getElementById("ra-context");
-    if (context) context.textContent = "Learning is stored for this project only, from its requirement document and your corrections.";
+    setContext();
     Array.prototype.forEach.call(document.querySelectorAll("#ra-project-list .ra-project"), function (button) {
       button.classList.toggle("active", Number(button.getAttribute("data-id")) === id);
     });
@@ -464,6 +604,14 @@
       view.report = result[3];
       renderProject(result[0], result[1]);
       renderTasks((result[2] && result[2].results) || []);
+      setContext();
+      var pill = document.getElementById("ra-learn-pill");
+      if (pill && result[1]) {
+        pill.textContent = result[1].learn_enabled === false
+          ? "Learning OFF"
+          : "Learning ON · learned from " + (result[1].finished_frames || 0) + " frames";
+        pill.title = pill.textContent;
+      }
     });
   }
 
@@ -474,9 +622,7 @@
     view.taskName = next.taskName || "";
     var panel = drawer();
     panel.classList.add("is-open");
-    document.getElementById("ra-context").textContent = view.projectId
-      ? "Learning is stored for this project only, from its requirement document and your corrections."
-      : "Create or open a project. Each project keeps its own requirement and learning.";
+    setContext();
     setStatus("ra-req-status", "");
     setStatus("ra-task-status", "");
     var chain = Promise.resolve();
@@ -818,6 +964,8 @@
       if (input) input.value = "";
       var noteNode = document.getElementById("ra-more-note");
       if (noteNode) noteNode.textContent = "No images chosen.";
+      var moreLabel = document.getElementById("ra-more-file-label");
+      if (moreLabel) moreLabel.textContent = "Images to add or replace";
       view.taskId = done.task.id;
       view.taskName = done.task.name || view.taskName;
       var note = adding
@@ -883,6 +1031,8 @@
       imageInput.value = "";
       var noteNode = document.getElementById("ra-task-file-note");
       if (noteNode) noteNode.textContent = "No images chosen.";
+      var taskFileLabel = document.getElementById("ra-task-file-label");
+      if (taskFileLabel) taskFileLabel.textContent = "Choose images";
       chooseTask(task.id, view.taskName, true);
       var note = "Task " + task.id + " is created with " + task.size + " image(s).";
       return refresh().then(function () {
@@ -972,6 +1122,8 @@
     var files = document.getElementById("ra-files");
     if (text) text.value = "";
     if (files) files.value = "";
+    var attachLabel = document.getElementById("ra-attach-label");
+    if (attachLabel) attachLabel.textContent = "Attach files";
     paintLog();
   }
 
@@ -979,9 +1131,12 @@
     var text = document.getElementById("ra-text");
     var files = document.getElementById("ra-files");
     var message = text.value.trim() || (files.files.length ? "Use the attached files." : "");
-    if (!message) return;
+    if (!message || agentBusy) return;
     history.push({ role: "user", content: message });
     saveHistory();
+    agentBusy = true;
+    var send = document.getElementById("ra-send");
+    if (send) send.disabled = true;
     paintLog();
     text.value = "";
     var body = new FormData();
@@ -991,6 +1146,8 @@
     if (view.taskId) body.append("task_id", String(view.taskId));
     Array.prototype.forEach.call(files.files, function (file) { body.append("files", file); });
     files.value = "";
+    var sentLabel = document.getElementById("ra-attach-label");
+    if (sentLabel) sentLabel.textContent = "Attach files";
     analyzer("/chat", { method: "POST", body: body }).then(function (result) {
       history.push({ role: "assistant", content: result.reply });
       saveHistory();
@@ -999,6 +1156,11 @@
     }).catch(function (error) {
       history.push({ role: "assistant", content: error.message });
       saveHistory();
+      paintLog();
+    }).then(function () {
+      agentBusy = false;
+      var send = document.getElementById("ra-send");
+      if (send) send.disabled = false;
       paintLog();
     });
   }
@@ -1263,18 +1425,166 @@
     learnTimers[jobId] = setTimeout(function () { learnSavedJob(jobId); }, 1500);
   }
 
-  function learnSavedJob(jobId) {
-    cvat("/api/jobs/" + jobId).then(function (job) {
+  var jobStates = {};
+  var badgeLocal = "";
+  var badgeData = null;
+
+  function paintBadge() {
+    var badge = document.getElementById("ra-learn-badge");
+    var panel = document.getElementById("ra-learn-panel");
+    if (!badge) return;
+    var text = "Learning unavailable";
+    if (badgeLocal === "running") text = "Learning ON · analyzing…";
+    else if (badgeLocal === "just") text = "Learned from this job";
+    else if (badgeLocal === "failed") text = "Learning ON · comparison failed";
+    else if (badgeLocal !== "down" && badgeData) {
+      text = badgeData.learn_enabled === false
+        ? "Learning OFF"
+        : "Learning ON · learned from " + (badgeData.finished_frames || 0) + " frames";
+    } else if (badgeLocal !== "down" && !badgeData) text = "Learning";
+    badge.textContent = text;
+    var pill = document.getElementById("ra-learn-pill");
+    if (pill) { pill.textContent = text; pill.title = text; }
+    badge.classList.toggle("is-running", badgeLocal === "running");
+    if (!panel) return;
+    var habits = (badgeData && badgeData.active_habits) || [];
+    var waiting = (badgeData && badgeData.waiting) || [];
+    panel.innerHTML = "<strong>" + text + "</strong><p class='ra-muted'>" + escapeHtml((badgeData && badgeData.mode_text) || "Learning stays inside this project.") + "</p>"
+      + (habits.length ? habits.map(function (item) { return "<p>" + escapeHtml(item) + "</p>"; }).join("") : "<p class='ra-muted'>No habit has enough examples yet. A habit needs 6 objects on 3 images. A correction needs 3 corrections on 2 images.</p>")
+      + (waiting.length ? "<p class='ra-muted'>Not sure yet: " + escapeHtml(waiting.join(" ")) + "</p>" : "")
+      + "<div class='ra-row'><button type='button' class='ra-btn' id='ra-badge-off'>" + (badgeData && badgeData.learn_enabled === false ? "Turn learning on" : "Turn learning off") + "</button><button type='button' class='ra-btn' id='ra-badge-forget'>Forget everything</button></div>";
+    var off = panel.querySelector("#ra-badge-off");
+    var forget = panel.querySelector("#ra-badge-forget");
+    if (off) off.onclick = function () { toggleLearning(!(badgeData && badgeData.learn_enabled)); };
+    if (forget) forget.onclick = function () {
+      if (!window.confirm("Forget everything this project has learned?")) return;
+      var projectId = badgeProjectId();
+      if (!projectId) return;
+      analyzer("/projects/" + projectId + "/learning/reset", { method: "POST" }).then(refreshBadge);
+    };
+  }
+
+  function badgeProjectId() {
+    return contextFromLocation().projectId || view.projectId || (badgeData && badgeData.project_id) || null;
+  }
+
+  function refreshBadge() {
+    ensureBadge();
+    var located = contextFromLocation();
+    var ready = located.projectId ? Promise.resolve(located.projectId) : (
+      located.taskId ? cvat("/api/tasks/" + located.taskId).then(function (task) { return task.project_id || null; }) : Promise.resolve(view.projectId || null)
+    );
+    ready.then(function (projectId) {
+      if (!projectId) return null;
+      return analyzer("/projects/" + projectId + "/learning");
+    }).then(function (data) {
+      if (!data) return;
+      badgeData = data;
+      if (badgeLocal === "down") badgeLocal = "";
+      paintBadge();
+    }).catch(function () {
+      badgeLocal = "down";
+      paintBadge();
+    });
+  }
+
+  function ensureBadge() {
+    var header = document.querySelector(".cvat-annotation-header");
+    var badge = document.getElementById("ra-learn-badge");
+    if (!header) {
+      if (badge) badge.remove();
+      var openPanel = document.getElementById("ra-learn-panel");
+      if (openPanel) openPanel.hidden = true;
+      return;
+    }
+    if (badge && header.contains(badge)) return;
+    if (badge) badge.remove();
+    ensureStyle();
+    badge = document.createElement("button");
+    badge.id = "ra-learn-badge";
+    badge.type = "button";
+    badge.textContent = "Learning";
+    var panel = document.getElementById("ra-learn-panel");
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.id = "ra-learn-panel";
+      panel.hidden = true;
+      document.body.appendChild(panel);
+    }
+    badge.onclick = function () { panel.hidden = !panel.hidden; if (!panel.hidden) refreshBadge(); };
+    var right = header.querySelector(".cvat-annotation-header-right-group");
+    if (right) right.insertBefore(badge, right.firstChild);
+    else header.appendChild(badge);
+    paintBadge();
+  }
+
+  function toggleLearning(enabled) {
+    var projectId = badgeProjectId();
+    if (!projectId) return;
+    analyzer("/projects/" + projectId + "/learning/settings", {
+      method: "POST",
+      json: { learn_enabled: enabled, annotation_mode: "mixed" },
+    }).then(refreshBadge);
+  }
+
+  function syncJobLearning(jobId) {
+    badgeLocal = "running";
+    paintBadge();
+    return cvat("/api/jobs/" + jobId).then(function (job) {
       if (!job.project_id) return null;
-      return analyzer("/projects/" + job.project_id + "/jobs/" + jobId + "/learn", { method: "POST" });
+      var previous = jobStates[job.id];
+      jobStates[job.id] = job.state;
+      if (job.state === "completed") {
+        return analyzer("/projects/" + job.project_id + "/jobs/" + jobId + "/learn", { method: "POST" });
+      }
+      if (previous === "completed") {
+        return analyzer("/projects/" + job.project_id + "/jobs/" + jobId + "/unlearn", { method: "POST" });
+      }
+      badgeLocal = "";
+      return null;
     }).then(function (result) {
+      if (result && result.samples != null && !result.skipped) {
+        badgeLocal = "just";
+        paintBadge();
+        setTimeout(function () { if (badgeLocal === "just") badgeLocal = ""; refreshBadge(); }, 4000);
+      } else {
+        badgeLocal = "";
+      }
       var node = document.getElementById("ra-learning");
-      if (!node || !result || result.skipped) return;
-      node.textContent = "Learned " + (result.samples || 0) + " frame(s) from your edits. " + (result.rules || 0) + " correction(s) will be used on the next task.";
+      if (node && result && result.samples != null) {
+        node.textContent = "Learned " + (result.samples || 0) + " frame(s) from your edits. " + (result.rules || 0) + " correction(s) will be used on the next task.";
+      }
+      return refreshBadge();
     }).catch(function (error) {
+      badgeLocal = "failed";
+      paintBadge();
       var node = document.getElementById("ra-learning");
       if (node) node.textContent = error.message || "The correction could not be learned.";
     });
+  }
+
+  function learnSavedJob(jobId) {
+    syncJobLearning(jobId);
+  }
+
+  function insertRequirementExport() {
+    var modal = document.querySelector(".cvat-modal-export-task, .cvat-modal-export-job, .cvat-modal-export-project");
+    if (!modal || modal.querySelector(".ra-requirement-export")) return;
+    var body = modal.querySelector(".ant-modal-body");
+    if (!body) return;
+    var box = document.createElement("div");
+    box.className = "ra-requirement-export";
+    box.innerHTML = "<p class='ra-muted'>Requirement format (from project spec). The file uses the output format and class names in this project's requirement. Shapes the agent drew and nobody reviewed stay out.</p><button type='button' class='ra-btn primary'>Export requirement format</button>";
+    box.querySelector("button").onclick = function () {
+      var job = location.pathname.match(/\/jobs\/(\d+)/);
+      var task = location.pathname.match(/\/tasks\/(\d+)/);
+      var project = location.pathname.match(/\/projects\/(\d+)/);
+      if (job) downloadRequirementExport("jobs", Number(job[1]));
+      else if (task) downloadRequirementExport("tasks", Number(task[1]));
+      else if (project) downloadRequirementExport("projects", Number(project[1]));
+      else exportNote("Open the project, task, or job before exporting its requirement format.");
+    };
+    body.appendChild(box);
   }
 
   function downloadRequirementExport(kind, id) {
@@ -1334,6 +1644,8 @@
       var address = String(url || "");
       var saved = address.match(/\/api\/jobs\/(\d+)\/annotations(?:\?|$)/);
       if (saved && (verb === "PUT" || verb === "PATCH")) scheduleLearn(saved[1]);
+      var jobState = address.match(/\/api\/jobs\/(\d+)(?:\?|$)/);
+      if (jobState && verb === "PATCH") scheduleLearn(jobState[1]);
       var exported = address.match(/\/api\/(projects|tasks|jobs)\/(\d+)\/dataset\/export(?:\?|$)/);
       if (exported && verb === "POST") {
         var body = {};
@@ -1384,5 +1696,10 @@
     insertAnnotationImageActions();
     insertProjectMenu();
     insertAiOption();
+    insertRequirementExport();
+    if (!window.__raBadgeAt || Date.now() - window.__raBadgeAt > 8000) {
+      window.__raBadgeAt = Date.now();
+      refreshBadge();
+    }
   }, 400);
 })();

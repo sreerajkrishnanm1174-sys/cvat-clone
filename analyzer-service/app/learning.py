@@ -14,10 +14,10 @@ from .geometry import (
     polygon_area,
 )
 
-HUMAN_OBJECTS = 2
-HUMAN_IMAGES = 1
-CORRECTION_OBJECTS = 1
-CORRECTION_IMAGES = 1
+HUMAN_OBJECTS = 6
+HUMAN_IMAGES = 3
+CORRECTION_OBJECTS = 3
+CORRECTION_IMAGES = 2
 
 MODE_TEXT = {
     "human_first": "You annotate, the agent learns",
@@ -374,12 +374,32 @@ def explain_rule(rule: dict) -> str:
     return prefix + kind
 
 
+def _lesson_ready(samples: list[dict], item: dict) -> bool:
+    """One drawing is remembered, but it is not taught until the evidence threshold is met."""
+    label = ((item.get("human") or {}).get("label") or (item.get("agent") or {}).get("label") or "")
+    role = item.get("role")
+    need_objects = CORRECTION_OBJECTS if role == "correction" else HUMAN_OBJECTS
+    need_images = CORRECTION_IMAGES if role == "correction" else HUMAN_IMAGES
+    count = 0
+    images = set()
+    for sample in samples:
+        for other in sample.get("items") or []:
+            other_label = ((other.get("human") or {}).get("label") or (other.get("agent") or {}).get("label") or "")
+            if other.get("role") == role and other_label == label:
+                count += 1
+                if sample.get("frame_key"):
+                    images.add(sample.get("frame_key"))
+    return count >= need_objects and len(images) >= need_images
+
+
 def prompt_lessons(profile: dict | None, samples: list[dict]) -> list[str]:
     """Plain corrections the vision agent must follow on the next images."""
     lines = []
     seen = set()
     for sample in samples:
         for item in sample.get("items") or []:
+            if not _lesson_ready(samples, item):
+                continue
             sentence = _correction_sentence(item)
             if sentence and sentence not in seen:
                 seen.add(sentence)

@@ -17,7 +17,7 @@ from .config import Settings, get_settings
 from .cvat import CvatClient, CvatError
 
 from .db import Prediction, Run, Sample, init_db, make_engine, make_session_factory
-from .learning import MODE_TEXT, explain_profile, prompt_lessons
+from .learning import MODE_TEXT, explain_profile, explain_rule, prompt_lessons
 from . import exporting, planning, report, service, spec
 from .vision import annotate_image
 from . import chat as agent_chat
@@ -299,11 +299,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict:
         _, state = open_project(project_id, client, session, who["organization"])
         explained = explain_profile(state.profile_json, state.finished_frames, state.annotation_mode)
+        rules = (state.profile_json or {}).get("rules") or []
         explained["learn_enabled"] = state.learn_enabled
         explained["compare_with_agent"] = state.compare_with_agent
         explained["allow_external_models"] = state.allow_external_models
         explained["profile_version"] = state.profile_version
-        explained["rules"] = (state.profile_json or {}).get("rules") or []
+        explained["rules"] = rules
+        explained["active_habits"] = [
+            explain_rule(rule) for rule in rules if rule.get("status") == "active"
+        ]
+        explained["waiting"] = explained.get("unresolved") or []
+        explained["running"] = 0
+        explained["last_error"] = None
+        explained["badge"] = "off" if not state.learn_enabled else "idle"
         return explained
 
     @app.post("/projects/{project_id}/learning/settings")
@@ -451,6 +459,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "finished_frames": state.finished_frames,
             "rules": len((state.profile_json or {}).get("rules") or []),
         }
+
+    @app.post("/projects/{project_id}/jobs/{job_id}/unlearn")
+    def unlearn_job(
+        project_id: int,
+        job_id: int,
+        who: dict = Depends(identity),
+        client: CvatClient = Depends(cvat_client),
+        session: Session = Depends(db),
+    ) -> dict:
+        _, state = open_project(project_id, client, session, who["organization"])
+        session.query(Sample).filter(
+            Sample.cvat_project_id == project_id,
+            Sample.job_id == job_id,
+        ).delete()
+        service.rebuild_profile(session, state)
+        return {"finished_frames": state.finished_frames, "removed_job_id": job_id}
 
     @app.get("/projects/{project_id}/export")
     def export_requirement_format(

@@ -250,7 +250,7 @@ def test_agent_plan_uses_only_deployed_models():
     assert plan["lane"]["agent"] == "claude_vision"
 
 
-def test_one_correction_is_used_on_the_next_image():
+def test_one_correction_is_not_yet_a_rule():
     from app.learning import prompt_lessons
 
     samples = [
@@ -265,6 +265,30 @@ def test_one_correction_is_used_on_the_next_image():
             ],
         }
     ]
+    profile = derive_profile(samples, {"labels": [{"name": "car", "type": "rectangle"}]})
+    assert not any(rule["kind"] == "box_offset" and rule["status"] == "active" for rule in profile["rules"])
+    lessons = prompt_lessons(profile, samples)
+    assert not any("left +5px" in lesson for lesson in lessons)
+
+
+def test_three_corrections_on_two_images_become_a_rule():
+    from app.learning import prompt_lessons
+
+    samples = []
+    for image in ("a", "b"):
+        for _ in range(2):
+            samples.append(
+                {
+                    "frame_key": image,
+                    "items": [
+                        {
+                            "role": "correction",
+                            "agent": {"label": "car", "type": "rectangle", "points": [0, 0, 100, 80], "attributes": {}},
+                            "human": {"label": "car", "type": "rectangle", "points": [5, 4, 90, 70], "attributes": {}},
+                        }
+                    ],
+                }
+            )
     profile = derive_profile(samples, {"labels": [{"name": "car", "type": "rectangle"}]})
     assert any(rule["kind"] == "box_offset" and rule["status"] == "active" for rule in profile["rules"])
     lessons = prompt_lessons(profile, samples)
@@ -737,7 +761,7 @@ def test_vision_shapes_and_correction_lessons():
             }
         ],
     )
-    assert any("road_defect" in line for line in lessons)
+    assert not any("road_defect" in line for line in lessons)
     skeleton = parse_shapes(
         json.dumps({
             "objects": [{

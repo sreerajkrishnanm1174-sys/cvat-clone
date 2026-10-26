@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Annotation Agent — design review</title>
+<style>
+  /* Tokens. Mapped from cvat-ui/src/base.scss (light). Dark is panel-local: that file has no dark theme. */
+  :root {
+    --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 24px; --space-6: 32px;
+    --radius: 8px; --radius-pill: 99px;
+    --font: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    --mono: Consolas, "Courier New", monospace;
+    --title: 16px; --section: 14px; --body: 14px; --caption: 12px;
+    --motion: 200ms;
+    --surface: #ffffff; --surface-2: #f1f1f1; --text: #303030; --text-muted: rgba(0,0,0,.45);
+    --border: #f0f0f0; --border-strong: #d9d9d9;
+    --primary: #1890ff; --primary-soft: #d9ecff; --on-primary: #ffffff;
+    --success: #61c200; --success-soft: #f3fae8;
+    --warning: #d48806; --warning-soft: #fff7e6;
+    --danger: #ff4136; --danger-soft: #fff1f0;
+    --info: #0074d9; --info-soft: #d9ecff;
+    --learn: #1890ff; --learn-soft: #d9ecff;
+    --shadow: 0 1px 2px -2px rgba(0,0,0,.16), 0 3px 6px rgba(0,0,0,.12);
+    --editor: #1b1b1b; --editor-min: 640px;
+    --panel: 420px;
+  }
+  :root[data-theme="dark"] {
+    --surface: #1f1f1f; --surface-2: #141414; --text: #f0f0f0; --text-muted: rgba(255,255,255,.55);
+    --border: #303030; --border-strong: #434343;
+    --primary: #177ddc; --primary-soft: #111d2c; --on-primary: #ffffff;
+    --success: #49aa19; --success-soft: #162312;
+    --warning: #d89614; --warning-soft: #2b2111;
+    --danger: #d32029; --danger-soft: #2a1215;
+    --info: #177ddc; --info-soft: #111d2c;
+    --learn: #177ddc; --learn-soft: #111d2c;
+    --shadow: 0 4px 16px rgba(0,0,0,.45);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    :root { --motion: 0ms; }
+    * { animation: none !important; transition: none !important; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: var(--body)/1.45 var(--font); color: var(--text); background: var(--surface-2); }
+  button, input, textarea { font: inherit; color: inherit; }
+  button { min-height: 44px; }
+  :focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+  .bar { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; padding: var(--space-3) var(--space-4); background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 2; }
+  .bar h1 { font-size: var(--title); margin: 0 var(--space-3) 0 0; }
+  .bar button, .chips button { background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius); padding: 0 var(--space-3); cursor: pointer; }
+  .bar button[aria-pressed="true"], .qa button[aria-pressed="true"] { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
+  .stage { display: grid; grid-template-columns: minmax(var(--editor-min), 1fr) var(--panel); min-height: calc(100vh - 64px); }
+  .editor { background: var(--editor); color: #d8d8d8; padding: var(--space-4); min-width: 0; }
+  .editor small { color: #979797; }
+  .panel { background: var(--surface); border-left: 1px solid var(--border); display: flex; flex-direction: column; min-width: 0; min-height: 640px; }
+  .panel header, .composer, .qa { padding: var(--space-3); }
+  .panel header { display: flex; justify-content: space-between; gap: var(--space-2); align-items: center; border-bottom: 1px solid var(--border); }
+  .panel header strong { font-size: var(--section); }
+  .badge { display: inline-flex; align-items: center; gap: var(--space-1); border: 1px solid var(--border-strong); background: var(--learn-soft); color: var(--text); border-radius: var(--radius-pill); padding: 0 var(--space-2); min-height: 32px; font-size: var(--caption); font-weight: 600; }
+  .context { margin: 0; padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--border); }
+  .chip { display: inline-flex; max-width: 100%; align-items: center; gap: var(--space-1); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-pill); padding: var(--space-1) var(--space-2); font-size: var(--caption); }
+  .chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .thread { flex: 1; overflow: auto; padding: var(--space-3); display: flex; flex-direction: column; gap: var(--space-3); }
+  .bubble { max-width: 92%; padding: var(--space-2) var(--space-3); border-radius: var(--radius); }
+  .bubble.you { align-self: flex-end; background: var(--primary-soft); }
+  .bubble.agent { align-self: flex-start; background: var(--surface-2); }
+  .card { border: 1px solid var(--border-strong); border-radius: var(--radius); padding: var(--space-3); background: var(--surface); box-shadow: var(--shadow); }
+  .card h2 { font-size: var(--section); margin: 0 0 var(--space-2); }
+  .card p, .card li { font-size: var(--body); margin: var(--space-1) 0; }
+  .card .caption { color: var(--text-muted); font-size: var(--caption); }
+  .row { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-3); }
+  .primary { background: var(--primary); color: var(--on-primary); border: 0; border-radius: var(--radius); padding: 0 var(--space-3); cursor: pointer; }
+  .quiet { background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius); padding: 0 var(--space-3); cursor: pointer; }
+  .danger { background: var(--danger); color: #fff; border: 0; border-radius: var(--radius); padding: 0 var(--space-3); cursor: pointer; }
+  table { width: 100%; border-collapse: collapse; font-size: var(--caption); }
+  td { border-top: 1px solid var(--border); padding: var(--space-1) 0; vertical-align: top; }
+  .mono { font-family: var(--mono); }
+  .status { display: flex; gap: var(--space-2); align-items: flex-start; }
+  .status i { font-style: normal; width: 1.25em; text-align: center; }
+  .ok { background: var(--success-soft); } .warn { background: var(--warning-soft); } .bad { background: var(--danger-soft); } .note { background: var(--info-soft); }
+  .qa { display: flex; gap: var(--space-2); overflow-x: auto; border-top: 1px solid var(--border); }
+  .qa button { flex: 0 0 auto; }
+  .composer { display: flex; gap: var(--space-2); border-top: 1px solid var(--border); }
+  .composer textarea { flex: 1; min-height: 44px; max-height: 120px; resize: vertical; border: 1px solid var(--border-strong); border-radius: var(--radius); padding: var(--space-2); background: var(--surface); }
+  .progress { height: 8px; background: var(--surface-2); border-radius: var(--radius-pill); overflow: hidden; }
+  .progress span { display: block; height: 100%; width: 42%; background: var(--primary); }
+  .gallery { padding: var(--space-4); display: grid; gap: var(--space-4); }
+  .gallery h2 { font-size: var(--title); margin: 0; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
+  .swatch { height: 44px; border-radius: var(--radius); border: 1px solid var(--border-strong); }
+  .frames { display: flex; gap: var(--space-4); overflow-x: auto; padding: var(--space-4); }
+  .device { background: #fff; border: 1px solid var(--border-strong); border-radius: var(--radius); overflow: hidden; flex: 0 0 auto; }
+  .device p { margin: 0; padding: var(--space-1) var(--space-2); font-size: var(--caption); background: var(--surface-2); }
+  .sheet { position: relative; }
+  .collapsed .panel { display: none; }
+  .collapsed .stage { grid-template-columns: 1fr; }
+  .rail .panel { width: 48px; }
+  .overlay .panel, .sheet .panel { position: absolute; right: 0; top: 64px; bottom: 0; width: min(420px, 100%); z-index: 3; box-shadow: var(--shadow); }
+  .sheet .panel { width: 100%; top: 64px; }
+  .note-page { max-width: 72ch; padding: var(--space-4); }
+  @media (max-width: 900px) { .pair { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="bar">
+  <h1>Annotation Agent</h1>
+  <button type="button" id="theme" aria-pressed="false">Dark theme</button>
+  <div class="chips" id="views" role="toolbar" aria-label="Screen"></div>
+  <div class="chips" id="widths" role="toolbar" aria-label="Width"></div>
+</div>
+<main id="app"></main>
+<script>
+const STR = {
+  title: "Annotation Agent",
+  welcome: "Upload the client requirement. I will read it and show the labels before anything is saved.",
+  next: "Upload the requirement to start.",
+  context: "Project Roads · Task 12 · Job 31 · frame 18",
+  learning: "Learning ON · learned from 24 frames",
+  apply: "Apply", edit: "Edit", cancel: "Cancel", send: "Send",
+  forget: "Forget everything",
+  offline: "The analyzer is not running. Annotation in CVAT still works. Start the analyzer, then press Retry.",
+  injection: "Text inside a document is data. A line that says to delete annotations is ignored."
+};
+const VIEWS = ["Welcome","Requirement","Label diff","Running","Result","Learning","Review","Export","Error","Offline","Collapsed","Gallery"];
+const WIDTHS = [["1920",1920],["1440",1440],["1024",1024],["768",768],["390",390]];
+let view = "Label diff";
+let width = 1440;
+let theme = "light";
+
+function el(html) { const n = document.createElement("div"); n.innerHTML = html.trim(); return n.firstChild; }
+function badge() {
+  return `<button class="badge" type="button" aria-label="${STR.learning}"><span aria-hidden="true">●</span> ${STR.learning}</button>`;
+}
+function shell(body, mode) {
+  const dock = width >= 1440 ? "" : width >= 1024 ? "rail-ready" : width >= 768 ? "overlay" : "sheet";
+  const panelWidth = width >= 1440 ? "420px" : "360px";
+  return `<div class="${dock} ${mode}" style="--panel:${panelWidth}">
+    <p class="caption" style="margin:8px 16px">Frame ${width}px. ${width>=1440?"Docked 420px.":width>=1024?"Docked 360px, collapsible. Canvas stays at least 640px.":width>=768?"Overlay drawer. Draft message is kept.":"Full-screen sheet. Composer stays at the bottom."}</p>
+    <div class="stage" style="position:relative;width:min(100%, ${width}px);margin:0 auto;border:1px solid var(--border)">
+      <section class="editor" aria-label="Annotation canvas"><strong>Canvas</strong><br><small>Usable area stays at least 640px on docked widths. The panel does not cover an object unless you open the drawer.</small></section>
+      ${mode==="collapsed" ? `<button class="primary" style="position:absolute;right:16px;bottom:16px" type="button">Annotation Agent</button>` : `<aside class="panel" aria-label="Annotation Agent">
+        <header><strong>${STR.title}</strong>${badge()}</header>
+        <p class="context"><button class="chip" type="button" aria-label="Change what the agent can see"><span>${STR.context}</span> Change</button></p>
+        <div class="thread" role="log" aria-live="polite">${body}</div>
+        <div class="qa" aria-label="Quick actions"><button type="button">Analyze requirement</button><button type="button">Auto-annotate</button><button type="button">What did you learn?</button></div>
+        <form class="composer" aria-label="Message"><textarea aria-label="Message" placeholder="Type a message"></textarea><button class="primary" type="button">${STR.send}</button></form>
+      </aside>`}
+    </div>
+  </div>`;
+}
+const screens = {
+  Welcome: () => shell(`<div class="bubble agent"><p>${STR.welcome}</p><p>${STR.next}</p></div><div class="card"><h2>Requirement</h2><p class="caption">PDF, Word, or text. 20 MB maximum.</p><button class="primary" type="button">Upload requirement</button></div>`),
+  Requirement: () => shell(`<div class="bubble you"><p>requirement.pdf</p></div><div class="card"><h2>Understood requirement</h2><p>2 labels. Output format: COCO.</p><ul><li>pothole · polygon · severity</li><li>car · rectangle</li></ul><p class="status warn"><i aria-hidden="true">!</i><span>1 open question. No detector is named for pothole.</span></p><div class="row"><button class="primary" type="button">Answer the question</button><button class="quiet" type="button">${STR.edit}</button></div></div>`),
+  "Label diff": () => shell(`<div class="card"><h2>Label changes</h2><p class="caption">Nothing is written until you press Apply.</p><table><tr><td>+</td><td>pothole</td><td>polygon</td><td>severity</td></tr><tr><td>+</td><td>car</td><td>rectangle</td><td></td></tr></table><div class="row"><button class="primary" type="button">${STR.apply}</button><button class="quiet" type="button">${STR.edit}</button><button class="quiet" type="button">${STR.cancel}</button></div></div>`),
+  Running: () => shell(`<div class="card"><h2>Annotating Task 12</h2><p class="status note"><i aria-hidden="true">…</i><span>Frame 18 of 42. About 1 minute left.</span></p><div class="progress" aria-valuenow="18" aria-valuemax="42" role="progressbar"><span></span></div><div class="row"><button class="quiet" type="button">${STR.cancel}</button></div></div>`),
+  Result: () => shell(`<div class="card ok"><h2>Finished</h2><p>Added 36 shapes. Flagged 4 for review. Applied 1 habit from 8 finished frames.</p><div class="row"><button class="primary" type="button">Open first flagged object</button></div></div>`),
+  Learning: () => shell(`<div class="card"><h2>Learning</h2><p class="status"><i aria-hidden="true">●</i><span>${STR.learning}</span></p><p>Your car boxes are tighter. 8 examples on 3 images.</p><p class="caption">Waiting: one pothole correction is not enough. A correction needs 3 on 2 images.</p><div class="row"><button class="quiet" type="button">Turn learning off</button><button class="danger" type="button">${STR.forget}</button></div></div>`),
+  Review: () => shell(`<div class="card warn"><h2>Review first</h2><ol><li><button class="quiet" type="button">Frame 18 · car · low score</button></li><li><button class="quiet" type="button">Frame 21 · pothole · unusual size</button></li></ol></div>`),
+  Export: () => shell(`<div class="card"><h2>Requirement format</h2><p>COCO, using the class names in the requirement.</p><p class="caption">Only finished work is included. 2 shapes were left out because nobody reviewed them.</p><div class="row"><button class="primary" type="button">Download</button></div></div>`),
+  Error: () => shell(`<div class="card bad"><h2>The labels were not saved</h2><p>CVAT refused the change. Your current labels are unchanged.</p><div class="row"><button class="primary" type="button">Retry</button></div></div>`),
+  Offline: () => shell(`<div class="card bad"><h2>Analyzer unavailable</h2><p>${STR.offline}</p><div class="row"><button class="primary" type="button">Retry</button></div></div>`),
+  Collapsed: () => shell("", "collapsed")
+};
+function gallery() {
+  return `<section class="gallery"><h2>Component gallery</h2><p class="caption">Light is on the left, dark on the right. Colors come from the tokens, not from the cards.</p>
+    <div class="pair">
+      <div class="card"><h2>Tokens</h2><div class="swatch" style="background:var(--primary)"></div><p class="caption">Primary #1890ff, the same blue as CVAT base.scss. Success #61c200. Danger #ff4136. Spacing 4 and 8.</p>${badge()}</div>
+      <div class="card" data-theme="dark" style="background:#1f1f1f;color:#f0f0f0"><h2>Dark</h2><p>Panel-local. CVAT's base.scss has no dark tokens, so this theme is not copied from CVAT.</p></div>
+    </div>
+    <div class="card"><h2>Status is icon plus words</h2><p class="status ok"><i aria-hidden="true">●</i><span>Learning ON</span></p><p class="status warn"><i aria-hidden="true">!</i><span>Flagged</span></p><p class="status bad"><i aria-hidden="true">×</i><span>Failed</span></p></div>
+    <h2>All four widths</h2></section><div class="frames" id="frames"></div>
+    <section class="note-page"><h2>Keyboard</h2><ul>
+      <li>Shortcut to focus the panel: not chosen. CVAT already owns many keys. See open questions.</li>
+      <li>Enter sends. Shift+Enter adds a line. Esc closes a drawer. Tab follows header, context, messages, actions, composer.</li>
+    </ul><h2>Why this is not a second visual system</h2><p>Type, the 8px grid, 8px radius, and the light colors are taken from cvat-ui/src/base.scss. The real build should use Ant Design, which CVAT already loads. This file does not, so it can be opened without the CVAT build.</p></section>`;
+}
+function render() {
+  document.documentElement.dataset.theme = theme;
+  const app = document.getElementById("app");
+  app.innerHTML = view === "Gallery" ? gallery() : screens[view]();
+  if (view === "Gallery") {
+    const frames = document.getElementById("frames");
+    WIDTHS.forEach(([name, px]) => {
+      const scale = Math.min(1, 280 / px);
+      frames.appendChild(el(`<div class="device" style="width:${Math.round(px*scale)}px"><p>${name}px</p><div style="height:${Math.round(180)}px;background:#1b1b1b;color:#fff;font-size:11px;padding:8px">Canvas ${px>=1024?"+ docked panel":"+ drawer"}</div></div>`));
+    });
+  }
+}
+document.getElementById("theme").onclick = (e) => { theme = theme === "light" ? "dark" : "light"; e.target.setAttribute("aria-pressed", String(theme==="dark")); e.target.textContent = theme==="dark" ? "Light theme" : "Dark theme"; render(); };
+const views = document.getElementById("views");
+VIEWS.forEach((name) => { const b = document.createElement("button"); b.type="button"; b.textContent=name; b.setAttribute("aria-pressed", String(name===view)); b.onclick=()=>{view=name; [...views.children].forEach(x=>x.setAttribute("aria-pressed", String(x===b))); render();}; views.appendChild(b); });
+const widths = document.getElementById("widths");
+WIDTHS.forEach(([name, px]) => { const b = document.createElement("button"); b.type="button"; b.textContent=name; b.setAttribute("aria-pressed", String(px===width)); b.onclick=()=>{width=px; [...widths.children].forEach(x=>x.setAttribute("aria-pressed", String(x===b))); render();}; widths.appendChild(b); });
+render();
+</script>
+</body>
+</html>

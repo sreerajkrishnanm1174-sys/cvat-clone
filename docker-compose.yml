@@ -252,6 +252,10 @@ services:
     container_name: cvat_ui
     image: cvat/ui:${CVAT_VERSION:-dev}
     restart: always
+    volumes:
+      - ./cvat-ui/nginx-agent.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./cvat-ui/requirement-agent.js:/usr/share/nginx/html/requirement-agent.js:ro
+      - ./cvat-ui/polygon-insert.js:/usr/share/nginx/html/polygon-insert.js:ro
     depends_on:
       - cvat_server
     labels:
