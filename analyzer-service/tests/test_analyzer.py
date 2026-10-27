@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import math
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -12,7 +13,7 @@ from app.main import create_app
 from app.planning import plan_agents
 from app.service import apply_profile_to_shape, label_patch, review_reasons
 from app.spec import diff_labels, extract_spec
-from app.geometry import crosses_self, resample_polygon
+from app.geometry import crosses_self, outline_is_template, resample_polygon, simplify_polygon
 from app.service import associate_by_iou
 
 
@@ -381,6 +382,13 @@ def test_correction_changes_the_next_box_and_point_count():
         "polygon",
     )
     assert len(thinned["points"]) // 2 == 4
+    bent = [0, 0, 40, 0, 40, 10, 20, 10, 20, 30, 0, 30]
+    assert len(simplify_polygon(bent)) // 2 == 6
+    assert outline_is_template([0, 0, 10, 0, 10, 10, 0, 10])
+    circle = []
+    for step in range(8):
+        circle.extend((math.cos(step * math.pi / 4) * 30, math.sin(step * math.pi / 4) * 30))
+    assert outline_is_template(circle)
 
 
 def test_classification_does_not_double_count():
@@ -850,6 +858,13 @@ def test_requirement_export_format():
     assert export_kind(parsed["output_format"]) == "yolo"
     assert export_kind("CVAT") == ""
     assert export_kind("COCO keypoints") == "coco"
+    assert export_kind("LabelMe") == "labelme"
+    assert export_kind("the client delivery pack") == "client"
+    spoken = extract_spec("Please export the annotations in COCO format.\n\nLabel: car\nType: rectangle\n")
+    assert spoken["output_format"].lower().startswith("coco")
+    from app.chat import revise_spec
+    saved = revise_spec(spoken, output_format="YOLO pose")
+    assert saved["output_format"] == "YOLO pose"
     blob = build_archive(
         "yolo",
         "YOLO v8 detection",
@@ -937,3 +952,280 @@ def test_image_upload_waits_for_cvat_import(monkeypatch):
     assert uploaded[0][0] == "client_files[0]"
     assert uploaded[1][0] == "client_files[1]"
     assert any(item[1] == "/api/requests/import-1" for item in calls)
+
+
+EXAMPLE = {
+    "dataset": {"name": "human_segmentation", "schema_version": "1.0"},
+    "images": [
+        {
+            "image_name": "image_001.jpg",
+            "width": 1920,
+            "height": 1080,
+            "objects": [
+                {
+                    "object_id": "person_001",
+                    "class_name": "person",
+                    "annotation_type": "polygon",
+                    "segmentation": [[120, 80], [150, 75], [175, 100], [160, 180], [130, 190]],
+                    "attributes": {"occluded": False},
+                }
+            ],
+        }
+    ],
+}
+
+
+def test_client_example_converts_polygon_and_keeps_structure():
+    from app.custom_format import analyze_files, convert_dataset
+
+    profile = analyze_files([("client.json", json.dumps(EXAMPLE).encode())])
+    assert profile["ready"]
+    assert any("inferred" in note.lower() or "review" in note.lower() for note in profile["ambiguities"])
+    images = [{
+        "name": "frame.jpg",
+        "width": 1920,
+        "height": 1080,
+        "shapes": [{
+            "id": 7,
+            "label": "person",
+            "type": "polygon",
+            "points": [120, 80, 150, 75, 175, 100, 160, 180, 130, 190],
+            "attributes": {"occluded": False},
+        }],
+    }]
+    document, report = convert_dataset(profile, "road", images)
+    assert report["errors"] == []
+    assert document["dataset"]["name"] == "road"
+    assert document["dataset"]["schema_version"] == "1.0"
+    obj = document["images"][0]["objects"][0]
+    assert document["images"][0]["image_name"] == "frame.jpg"
+    assert obj["class_name"] == "person"
+    assert obj["segmentation"][0] == [120, 80]
+    assert obj["object_id"] == "person_001"
+
+
+def test_client_format_blocks_masks_and_rejects_malformed_or_schema_only_input():
+    from app.custom_format import analyze_files, package
+
+    profile = analyze_files([("client.json", json.dumps(EXAMPLE).encode())])
+    blob, report = package(profile, "road", [{
+        "name": "frame.jpg",
+        "width": 100,
+        "height": 80,
+        "shapes": [{"label": "person", "type": "mask", "points": []}],
+    }])
+    assert blob is None
+    assert any("mask" in error.lower() for error in report["errors"])
+    broken = analyze_files([("bad.json", b"{")])
+    assert broken["ready"] is False
+    schema = analyze_files([("spec.json", json.dumps({"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"images": {"type": "array"}}}).encode())])
+    assert schema["ready"] is False
+    assert schema["ambiguities"]
+
+
+def test_client_format_flags_normalized_text_that_disagrees_with_the_example():
+    from app.custom_format import analyze_files
+
+    text = "Use normalized coordinates between 0 and 1.\n" + json.dumps(EXAMPLE)
+    profile = analyze_files([("notes.txt", text.encode())])
+    assert profile["ready"]
+    assert profile["coordinates"] == "pixel"
+    assert any("pixel" in note.lower() for note in profile["ambiguities"])
+
+
+def test_custom_format_export_downloads_zip_and_hides_other_organizations(tmp_path):
+    client, fake = _client(tmp_path)
+    fake.labels = [{"id": 1, "name": "person", "type": "polygon"}]
+    fake.annotations = {
+        "shapes": [{
+            "id": 4,
+            "frame": 0,
+            "label_id": 1,
+            "type": "polygon",
+            "points": [1, 2, 3, 4, 5, 6],
+            "occluded": False,
+            "source": "manual",
+            "attributes": [],
+        }],
+        "tracks": [],
+        "tags": [],
+    }
+    analyzed = client.post(
+        "/projects/1/custom-format/analyze",
+        files=[("files", ("client.json", json.dumps(EXAMPLE).encode(), "application/json"))],
+        headers={"Authorization": "Bearer user"},
+    )
+    assert analyzed.status_code == 200, analyzed.text
+    profile = analyzed.json()["profile"]
+    exported = client.post(
+        "/projects/1/custom-format/export",
+        json={"profile": profile, "save": True, "task_id": 7, "preview": False},
+        headers={"Authorization": "Bearer user"},
+    )
+    assert exported.status_code == 200, exported.text
+    assert exported.headers["content-type"].startswith("application/zip")
+    missing = client.post(
+        "/projects/1/custom-format/export",
+        json={"profile_id": 999, "task_id": 7},
+        headers={"Authorization": "Bearer user"},
+    )
+    assert missing.status_code == 404
+    saved = client.get("/projects/1/custom-format/profiles", headers={"Authorization": "Bearer user"})
+    assert saved.json()["profiles"]
+
+
+ROAD_REQUIREMENT = """
+Format: JSON
+Delivery folder structure
+annotations/instances_batch_001.json
+images/
+{
+  "images": [{"id": 1, "file_name": "image_0001.jpg", "width": 1280, "height": 720}],
+  "categories": [{"id": 1, "name": "vehicle"}, {"id": 2, "name": "road_defect"}],
+  "annotations": [
+    {"id": 1, "image_id": 1, "category_id": 1, "class_id": 1, "bbox": [320, 210, 260, 170], "box_xywh": [320, 210, 260, 170], "area": 44200, "iscrowd": 0, "attributes": {"color": "white"}, "track_id": "clip_001_vehicle_01"},
+    {"id": 2, "image_id": 1, "category_id": 2, "class_id": 2, "segmentation": [[610, 520, 660, 505, 700, 530]], "area": 0, "iscrowd": 0, "attributes": {"severity": "medium"}}
+  ]
+}
+"""
+
+
+def test_saved_requirement_sets_json_folder_and_blocks_a_bad_shape(tmp_path):
+    import io
+    import zipfile
+    from app.custom_format import analyze_files, package
+
+    profile = analyze_files([("requirement.txt", ROAD_REQUIREMENT.encode())])
+    assert profile["ready"]
+    assert profile["container"] == "json"
+    assert profile["annotation_file"] == "annotations/instances_batch_001.json"
+    assert profile["images_dir"] == "images"
+    images = [
+        {
+            "name": "frame.jpg",
+            "width": 1280,
+            "height": 720,
+            "shapes": [
+                {"label": "vehicle", "type": "rectangle", "points": [10, 20, 30, 50], "attributes": {"color": "white"}, "track_id": "v1"},
+                {"label": "road_defect", "type": "polygon", "points": [1, 2, 3, 2, 3, 4], "attributes": {"severity": "low"}},
+            ],
+        }
+    ]
+    blob, report = package(profile, "road", images)
+    assert report["errors"] == [], report
+    with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+        document = json.loads(archive.read("annotations/instances_batch_001.json"))
+    assert document["annotations"][0]["bbox"] == [10, 20, 20, 30]
+    assert document["annotations"][0]["class_id"] == 1
+    assert document["annotations"][1]["segmentation"][0][:2] == [1, 2]
+    blocked, blocked_report = package(profile, "road", [{
+        "name": "frame.jpg",
+        "width": 100,
+        "height": 80,
+        "shapes": [{"label": "vehicle", "type": "mask", "points": []}],
+    }])
+    assert blocked is None
+    assert blocked_report["errors"]
+
+
+def test_requirement_on_the_project_is_used_for_export(tmp_path):
+    import io
+    import zipfile
+
+    folder = tmp_path / "uploads" / "1"
+    folder.mkdir(parents=True)
+    (folder / "requirement.txt").write_text(ROAD_REQUIREMENT, encoding="utf-8")
+    client, fake = _client(tmp_path)
+    fake.labels = [{"id": 1, "name": "vehicle", "type": "rectangle"}]
+    fake.annotations = {
+        "shapes": [{
+            "id": 4,
+            "frame": 0,
+            "label_id": 1,
+            "type": "rectangle",
+            "points": [10, 20, 30, 50],
+            "occluded": False,
+            "source": "manual",
+            "attributes": [{"name": "color", "value": "white"}],
+            "track_id": "v1",
+        }],
+        "tracks": [],
+        "tags": [],
+    }
+    exported = client.get("/projects/1/export?task_id=7", headers={"Authorization": "Bearer user"})
+    assert exported.status_code == 200, exported.text
+    with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+        assert "annotations/instances_batch_001.json" in archive.namelist()
+        document = json.loads(archive.read("annotations/instances_batch_001.json"))
+    assert document["images"][0]["file_name"] == "a.jpg"
+    assert document["annotations"][0]["attributes"]["color"] == "white"
+
+
+HSEG_REQUIREMENT = """
+human_segmentation_export/
+manifest.hseg.json
+images/
+masks/
+{
+  "format": "HSEG",
+  "format_version": "1.0",
+  "project": {"project_key": "human_segmentation", "label_set": [{"label_key": "human", "display_name": "Human"}]},
+  "assets": [{
+    "asset_key": "scene_0001",
+    "source_file": "images/scene_0001.jpg",
+    "image_size": {"width_px": 1280, "height_px": 720},
+    "instances": [{
+      "instance_key": "scene_0001_human_0001",
+      "label_key": "human",
+      "geometry": {"kind": "polygon", "coordinate_space": "image_pixels_top_left", "vertices": [[10, 10], [40, 10], [40, 40], [10, 40]]},
+      "mask_file": "masks/scene_0001/human_0001.png",
+      "visible_region_only": true,
+      "attributes": {"occlusion_level": "partial", "truncated_by_image_edge": false},
+      "annotation_state": "review_required"
+    }]
+  }]
+}
+"""
+
+
+def test_hseg_example_builds_manifest_and_mask():
+    import io
+    import zipfile
+    from app.custom_format import analyze_files, package
+
+    profile = analyze_files([("hseg.txt", HSEG_REQUIREMENT.encode())])
+    assert profile["ready"]
+    assert profile["layout"] == "hseg"
+    assert profile["annotation_file"] == "human_segmentation_export/manifest.hseg.json"
+    blob, report = package(profile, "human seg", [{
+        "name": "scene_0001.jpg",
+        "width": 100,
+        "height": 80,
+        "content": b"image-bytes",
+        "shapes": [{
+            "label": "human",
+            "type": "polygon",
+            "points": [10, 10, 40, 10, 40, 50, 10, 50],
+            "attributes": {},
+        }],
+    }])
+    assert report["errors"] == [], report
+    with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+        manifest = json.loads(archive.read("human_segmentation_export/manifest.hseg.json"))
+        mask_name = "human_segmentation_export/masks/scene_0001/human_0001.png"
+        assert mask_name in archive.namelist()
+        assert "human_segmentation_export/images/scene_0001.jpg" in archive.namelist()
+    instance = manifest["assets"][0]["instances"][0]
+    assert manifest["format"] == "HSEG"
+    assert instance["geometry"]["vertices"][0] == [10, 10]
+    assert instance["mask_file"] == "masks/scene_0001/human_0001.png"
+    refused = package(profile, "human seg", [{
+        "name": "scene_0001.jpg",
+        "width": 100,
+        "height": 80,
+        "content": b"image-bytes",
+        "shapes": [{"label": "human", "type": "rectangle", "points": [1, 2, 3, 4]}],
+    }])
+    assert refused[0] is None
+
+

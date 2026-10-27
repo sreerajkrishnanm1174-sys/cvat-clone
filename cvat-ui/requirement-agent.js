@@ -157,6 +157,9 @@
       "#ra-tools .ra-split .wide{grid-column:1 / -1}",
       ".ra-card h3{margin:0 0 6px;font-size:13px;font-weight:650}",
       ".ra-muted{color:#667085;font-size:12px;margin:0 0 10px;line-height:1.4}",
+      ".ra-custom-export{margin-top:14px;padding-top:12px;border-top:1px solid #eaecf0}",
+      ".ra-custom-export .ra-file{position:relative;display:flex;align-items:center;width:100%;height:40px;box-sizing:border-box;margin:0 0 8px;padding:0 12px;border:1px solid #d0d5dd;border-radius:8px;background:#fff;cursor:pointer;overflow:hidden}",
+      ".ra-custom-export .ra-file input{position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;cursor:pointer}",
       ".ra-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}",
       ".ra-btn{border:1px solid #d0d5dd;background:#fff;border-radius:8px;padding:0 12px;height:36px;font-size:13px;cursor:pointer;color:#1f2430}",
       ".ra-btn.primary{background:#1890ff;border-color:#1890ff;color:#fff}",
@@ -183,7 +186,7 @@
       ".ra-project span{color:#667085;font-size:12px}",
       "#ra-new-name,#ra-task-name,#ra-task-choose,#ra-task-images{width:100%;box-sizing:border-box;border:1px solid #d9d9d9;border-radius:6px;padding:7px 8px;margin:0 0 8px;font:inherit;background:#fff}",
       "#ra-new{margin-top:8px}",
-      "#ra-export-note{position:fixed;right:16px;bottom:16px;z-index:10001;max-width:320px;padding:10px 12px;border-radius:8px;background:#17324d;color:#fff;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.18)}",
+      "#ra-export-note{position:fixed;right:16px;bottom:16px;z-index:10001;max-width:320px;padding:10px 12px;border:0;border-radius:8px;background:#17324d;color:#fff;font:13px/1.4 Segoe UI,Helvetica Neue,Arial,sans-serif;text-align:left;box-shadow:0 8px 24px rgba(0,0,0,.18);cursor:pointer}",
       "#ra-learn-badge{height:32px;margin:0 8px 0 0;padding:0 12px;border:1px solid #d6e4ff;border-radius:99px;background:#f5f8ff;color:#17324d;font:600 12px/30px sans-serif;cursor:pointer;white-space:nowrap}",
       "#ra-learn-badge.is-running{animation:ra-pulse 1s ease-in-out infinite}",
       "@keyframes ra-pulse{50%{opacity:.45}}",
@@ -1107,6 +1110,26 @@
     }).catch(function (error) { setStatus("ra-task-status", error.message); });
   }
 
+  function downloadReadyExport(download) {
+    exportNote("Downloading " + (download.filename || "the client format") + "…");
+    token().then(function (value) {
+      return fetch("/analyzer/exports/" + download.token, { headers: { Authorization: "Bearer " + value } });
+    }).then(function (response) {
+      if (!response.ok) throw new Error("The client format could not be downloaded.");
+      return response.blob();
+    }).then(function (blob) {
+      var link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = download.filename || "client-format.zip";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      exportNote("Downloaded " + (download.filename || "the client format") + ".");
+    }).catch(function () {
+      exportNote("The client format could not be downloaded.");
+    });
+  }
+
   function onLearnToggle(event) {
     if (!view.projectId) return;
     analyzer("/projects/" + view.projectId + "/learning/settings", {
@@ -1152,6 +1175,7 @@
       history.push({ role: "assistant", content: result.reply });
       saveHistory();
       paintLog();
+      if (result.download && result.download.token) downloadReadyExport(result.download);
       return refresh();
     }).catch(function (error) {
       history.push({ role: "assistant", content: error.message });
@@ -1398,8 +1422,11 @@
       return;
     }
     if (!node) {
-      node = document.createElement("div");
+      node = document.createElement("button");
       node.id = "ra-export-note";
+      node.type = "button";
+      node.title = "Click to close";
+      node.onclick = function () { exportNote(""); };
       document.body.appendChild(node);
     }
     node.textContent = text;
@@ -1574,7 +1601,7 @@
     if (!body) return;
     var box = document.createElement("div");
     box.className = "ra-requirement-export";
-    box.innerHTML = "<p class='ra-muted'>Requirement format (from project spec). The file uses the output format and class names in this project's requirement. Shapes the agent drew and nobody reviewed stay out.</p><button type='button' class='ra-btn primary'>Export requirement format</button>";
+    box.innerHTML = "<p class='ra-muted' id='ra-export-format'>Reads the requirement already on this project, follows its example and folder layout, checks the result, then downloads it.</p><button type='button' class='ra-btn primary'>Download client format</button>";
     box.querySelector("button").onclick = function () {
       var job = location.pathname.match(/\/jobs\/(\d+)/);
       var task = location.pathname.match(/\/tasks\/(\d+)/);
@@ -1585,6 +1612,107 @@
       else exportNote("Open the project, task, or job before exporting its requirement format.");
     };
     body.appendChild(box);
+    var custom = document.createElement("div");
+    custom.className = "ra-custom-export";
+    custom.innerHTML = "<p class='ra-muted'>Custom client format. Analyze uses the requirement already on this project. You can also upload another example. Export runs only after the check passes.</p><label class='ra-file'>Client document<input id='ra-client-doc' type='file' multiple accept='.json,.txt,.md,.yaml,.yml,.csv,.pdf,.docx'></label><div class='ra-row'><button type='button' class='ra-btn' id='ra-client-analyze'>Analyze requirements</button><button type='button' class='ra-btn primary' id='ra-client-export' disabled>Export this format</button></div><pre class='ra-custom-summary' id='ra-client-summary' hidden></pre>";
+    var clientProfile = null;
+    custom.querySelector("#ra-client-analyze").onclick = function () {
+      var input = custom.querySelector("#ra-client-doc");
+      scopeProjectId().then(function (projectId) {
+        if (!projectId) return;
+        var form = new FormData();
+        if (input.files) Array.prototype.forEach.call(input.files, function (file) { form.append("files", file); });
+        exportNote(input.files && input.files.length ? "Reading the client document…" : "Reading the requirement already on this project…");
+        return token().then(function (value) {
+          return fetch("/analyzer/projects/" + projectId + "/custom-format/analyze", {
+            method: "POST",
+            headers: { Authorization: "Bearer " + value },
+            body: form,
+          });
+        });
+      }).then(function (response) {
+        if (!response) return;
+        return response.json().then(function (data) {
+          clientProfile = data.profile || null;
+          var summary = document.getElementById("ra-client-summary");
+          var lines = (data.ambiguities || []).slice();
+          if (clientProfile && clientProfile.ready) {
+            lines.unshift("Output: " + (clientProfile.container || "json").toUpperCase() + " in " + (clientProfile.annotation_file || "annotations.json") + ".");
+            lines.unshift("Ready to export after you accept the notes below.");
+          } else {
+            lines.unshift("This document is not enough to build the format yet.");
+          }
+          summary.hidden = false;
+          summary.textContent = lines.join("\n");
+          custom.querySelector("#ra-client-export").disabled = !(clientProfile && clientProfile.ready);
+          exportNote("");
+        });
+      }).catch(function () {
+        exportNote("The client document could not be read.");
+      });
+    };
+    custom.querySelector("#ra-client-export").onclick = function () {
+      if (!clientProfile || !clientProfile.ready) return;
+      scopeProjectId().then(function (projectId) {
+        if (!projectId) return;
+        var scope = exportScope();
+        exportNote("Converting and checking the client format…");
+        return token().then(function (value) {
+          return fetch("/analyzer/projects/" + projectId + "/custom-format/export", {
+            method: "POST",
+            headers: { Authorization: "Bearer " + value, "Content-Type": "application/json" },
+            body: JSON.stringify({ profile: clientProfile, save: true, task_id: scope.task_id, job_id: scope.job_id }),
+          });
+        });
+      }).then(function (response) {
+        if (!response) return;
+        if (response.status === 422) {
+          return response.json().then(function (data) {
+            var errors = (data.report && data.report.errors) || [];
+            exportNote(errors[0] || "The client format did not pass validation.");
+          });
+        }
+        if (!response.ok) {
+          exportNote("The client format could not be created.");
+          return;
+        }
+        return response.blob().then(function (blob) {
+          var link = document.createElement("a");
+          link.href = URL.createObjectURL(blob);
+          link.download = "client-format.zip";
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          exportNote("Downloaded the client format.");
+        });
+      }).catch(function () {
+        exportNote("The client format could not be created.");
+      });
+    };
+    box.appendChild(custom);
+  }
+
+  function scopeProjectId() {
+    var scope = exportScope();
+    if (scope.project_id) return Promise.resolve(scope.project_id);
+    var kind = scope.job_id ? "jobs" : "tasks";
+    var id = scope.job_id || scope.task_id;
+    if (!id) {
+      exportNote("Open the project, task, or job before exporting.");
+      return Promise.resolve(null);
+    }
+    return cvat("/api/" + kind + "/" + id).then(function (resource) { return resource.project_id || null; });
+  }
+
+  function exportScope() {
+    var job = location.pathname.match(/\/jobs\/(\d+)/);
+    var task = location.pathname.match(/\/tasks\/(\d+)/);
+    var project = location.pathname.match(/\/projects\/(\d+)/);
+    return {
+      job_id: job ? Number(job[1]) : null,
+      task_id: task && !job ? Number(task[1]) : null,
+      project_id: project && !task && !job ? Number(project[1]) : null,
+    };
   }
 
   function downloadRequirementExport(kind, id) {
@@ -1603,13 +1731,22 @@
       if (!response) return;
       var type = response.headers.get("content-type") || "";
       if (!response.ok) {
-        exportNote("The requirement format could not be created.");
-        setTimeout(function () { exportNote(""); }, 4000);
-        return;
+        return response.json().then(function (data) {
+          exportNote((data && data.message) || "The requirement format did not pass verification.");
+          setTimeout(function () { exportNote(""); }, 6000);
+        }).catch(function () {
+          exportNote("The requirement format could not be created.");
+          setTimeout(function () { exportNote(""); }, 4000);
+        });
       }
       if (type.indexOf("zip") === -1) {
-        exportNote("");
-        return;
+        return response.json().then(function (data) {
+          exportNote((data && data.message) || "Name the client format in the requirement or in chat, then export again.");
+          setTimeout(function () { exportNote(""); }, 6000);
+        }).catch(function () {
+          exportNote("The client format could not be created.");
+          setTimeout(function () { exportNote(""); }, 4000);
+        });
       }
       var header = response.headers.get("content-disposition") || "";
       var match = /filename="?([^";]+)"?/.exec(header);

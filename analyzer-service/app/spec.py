@@ -424,16 +424,35 @@ def _minimum_size(text: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def named_format(text: str) -> str | None:
+    """The output format named in a requirement document or a chat instruction."""
+    heading = re.search(
+        r"(?:output|export|annotation|client|delivery)\s+format\s*[:\-]\s*([^\n]+)",
+        text or "",
+        flags=re.I,
+    )
+    if heading:
+        return heading.group(1).strip().rstrip(".")
+    sentence = re.search(
+        r"(?:export|save|convert|deliver|provide|output|download)\s+(?:the\s+)?(?:annotations?\s+)?(?:in|as|to)\s+([A-Za-z0-9][A-Za-z0-9 ._+-]{1,48})",
+        text or "",
+        flags=re.I,
+    )
+    if sentence:
+        return sentence.group(1).strip().rstrip(".")
+    known = re.search(r"\b(COCO|YOLO(?:\s*v?\d+)?(?:\s*pose)?|Pascal\s*VOC|\bVOC\b|LabelMe|KITTI|MOT|CSV)\b", text or "", flags=re.I)
+    if known and re.search(r"\b(format|export|output|download)\b", text or "", flags=re.I):
+        return known.group(1).strip()
+    return None
+
+
 def extract_spec(text: str) -> dict:
     embedded = _json_block(text)
     if embedded and embedded.get("labels"):
         return _normalize(embedded)
     labels = []
     questions = []
-    output_format = "CVAT"
-    format_match = re.search(r"(?:output|export|annotation)\s+format\s*:\s*(.+)", text, flags=re.I)
-    if format_match:
-        output_format = format_match.group(1).strip()
+    output_format = named_format(text) or "CVAT"
     examples = _example_annotations(text)
     shared_min_size = _minimum_size(text)
     blocks = re.split(r"\n(?=Label\s*:)", text, flags=re.I)

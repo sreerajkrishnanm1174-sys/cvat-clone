@@ -7,6 +7,8 @@ import re
 
 import httpx
 
+from .geometry import outline_is_template, simplify_polygon
+
 FALLBACK_MODELS = (
     "claude-sonnet-5-5",
     "claude-sonnet-5",
@@ -25,9 +27,10 @@ rules, and general guidelines. Find every object that matches a label and return
 Coordinates are pixels in the image you were given (origin top-left).
 By label annotation_type:
 - bounding_box: bbox only.
-- polygon and mask: bbox plus polygon. Trace the visible boundary. Put a point wherever the
-  edge changes direction. Use as many points as the shape needs, usually 12 to 40.
-  A fixed 4-point or 6-point outline is wrong unless the object really has that many corners.
+- polygon and mask: bbox plus polygon. Trace the visible silhouette. Put a point only where the
+  edge turns. A straight edge has its two corners and nothing between them. A curve or a bend gets
+  more points. The count must change with the object. Never reuse one point count, and never return
+  a rectangle made from the bbox.
 - points: one keypoint for each name in keypoints.
 - skeleton: one keypoint for EVERY name in keypoints. v=2 when the joint is visible,
   v=1 when it is hidden but its position can be estimated, v=0 when it is not in the image
@@ -149,6 +152,8 @@ def parse_shapes(text: str, labels: list[dict], scale: float, width: int, height
                 break
         if points and max(points) <= 1.5:
             points = [value * (width if index % 2 == 0 else height) for index, value in enumerate(points)]
+        if kind == "polygon" and len(points) >= 6:
+            points = simplify_polygon(points)
         if kind == "rectangle" and len(points) < 4:
             continue
         if kind == "polygon" and len(points) < 6:
@@ -287,7 +292,14 @@ def _reference_points(item: dict, kind: str) -> list:
 
 
 def _coarse_polygons(shapes: list[dict]) -> bool:
-    return any(shape.get("type") == "polygon" and len(shape.get("points") or []) < 16 for shape in shapes)
+    return any(
+        shape.get("type") == "polygon"
+        and (
+            len(shape.get("points") or []) < 16
+            or outline_is_template(shape.get("points") or [])
+        )
+        for shape in shapes
+    )
 
 
 def _vertex_count(shapes: list[dict]) -> int:
@@ -308,9 +320,9 @@ def _refine_polygons(
 ) -> list[dict]:
     prompt = build_prompt(labels, lessons, width, height)
     prompt += (
-        "\nThe previous outlines used a fixed handful of points and missed the boundary. "
-        "Trace each visible edge again. Add a point wherever the boundary turns. "
-        "Do not return a 4-point or 6-point template."
+        "\nThe previous outline used one fixed point count and did not follow the silhouette. "
+        "Trace the visible boundary again. Add a point only where the edge turns, and leave straight edges with just their corners. "
+        "Two objects must not get the same point count unless their outlines really match."
     )
     try:
         response = httpx.post(

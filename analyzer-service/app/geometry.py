@@ -110,6 +110,74 @@ def mean_spacing(points: list[float]) -> float:
     return sum(lengths) / len(lengths)
 
 
+def simplify_polygon(points: list[float], ratio: float = 0.012) -> list[float]:
+    """Drop points that sit on a straight edge. Keep a point where the outline turns."""
+    pts = pairs(points)
+    if len(pts) < 4:
+        return list(points)
+    cx, cy = centroid(points)
+    start = max(range(len(pts)), key=lambda index: math.hypot(pts[index][0] - cx, pts[index][1] - cy))
+    rotated = pts[start:] + pts[:start]
+    xs = [point[0] for point in rotated]
+    ys = [point[1] for point in rotated]
+    diagonal = math.hypot(max(xs) - min(xs), max(ys) - min(ys)) or 1.0
+    simplified = _rdp(rotated + [rotated[0]], max(1.5, diagonal * ratio))
+    if simplified and simplified[0] == simplified[-1]:
+        simplified = simplified[:-1]
+    if len(simplified) < 3:
+        return list(points)
+    return flat(simplified)
+
+
+def outline_is_template(points: list[float]) -> bool:
+    """A regular or four-corner outline is a stencil, not a traced silhouette."""
+    pts = pairs(points)
+    count = len(pts)
+    if count < 4:
+        return False
+    if count == 4:
+        return True
+    edges = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:] + pts[:1])]
+    if min(edges) <= 0:
+        return False
+    edge_spread = (max(edges) - min(edges)) / max(edges)
+    turns = []
+    for index, point in enumerate(pts):
+        previous = pts[index - 1]
+        nxt = pts[(index + 1) % count]
+        first = math.atan2(point[1] - previous[1], point[0] - previous[0])
+        second = math.atan2(nxt[1] - point[1], nxt[0] - point[0])
+        turn = abs((second - first + math.pi) % (2 * math.pi) - math.pi)
+        turns.append(turn)
+    turn_spread = (max(turns) - min(turns)) / math.pi
+    return count >= 6 and edge_spread < 0.18 and turn_spread < 0.12
+
+
+def _point_line_distance(point, start, end) -> float:
+    span = math.hypot(end[0] - start[0], end[1] - start[1])
+    if span == 0:
+        return math.hypot(point[0] - start[0], point[1] - start[1])
+    return abs((end[0] - start[0]) * (start[1] - point[1]) - (start[0] - point[0]) * (end[1] - start[1])) / span
+
+
+def _rdp(pts: list[tuple[float, float]], tolerance: float) -> list[tuple[float, float]]:
+    if len(pts) < 3:
+        return list(pts)
+    start, end = pts[0], pts[-1]
+    farthest = 0.0
+    index = 0
+    for cursor in range(1, len(pts) - 1):
+        distance = _point_line_distance(pts[cursor], start, end)
+        if distance > farthest:
+            farthest = distance
+            index = cursor
+    if farthest > tolerance and index:
+        left = _rdp(pts[: index + 1], tolerance)
+        right = _rdp(pts[index:], tolerance)
+        return left[:-1] + right
+    return [start, end]
+
+
 def resample_polygon(points: list[float], target: int) -> list[float]:
     """Match a polygon's point count by walking its outline."""
     pts = pairs(points)

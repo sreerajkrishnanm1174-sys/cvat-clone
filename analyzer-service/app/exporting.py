@@ -15,13 +15,21 @@ def export_kind(output_format: str | None) -> str:
         return ""
     if "coco" in value:
         return "coco"
+    if "labelme" in value or "label me" in value:
+        return "labelme"
+    if "csv" in value or "comma" in value:
+        return "csv"
+    if "kitti" in value:
+        return "kitti"
+    if re.search(r"\bmot\b", value) or "multiple object tracking" in value:
+        return "mot"
     if "pascal" in value or re.search(r"\bvoc\b", value):
         return "voc"
     if "pose" in value or "keypoint" in value or "skeleton" in value:
         return "yolo-pose"
     if "yolo" in value or "ultralytics" in value:
         return "yolo"
-    return ""
+    return "client"
 
 
 def build_archive(kind: str, output_format: str, label_names: list[str], images: list[dict]) -> bytes:
@@ -37,6 +45,18 @@ def build_archive(kind: str, output_format: str, label_names: list[str], images:
         elif kind == "voc":
             for image in images:
                 archive.writestr(f"Annotations/{_stem(image['name'])}.xml", _voc(image, classes))
+        elif kind == "labelme":
+            for image in images:
+                archive.writestr(f"{_stem(image['name'])}.json", json.dumps(_labelme(image), indent=2))
+        elif kind == "csv":
+            archive.writestr("annotations.csv", _csv(images))
+        elif kind == "kitti":
+            for image in images:
+                archive.writestr(f"label_2/{_stem(image['name'])}.txt", _kitti(image))
+        elif kind == "mot":
+            archive.writestr("gt/gt.txt", _mot(images))
+        elif kind == "client":
+            archive.writestr("annotations.json", json.dumps(_client_json(output_format, images), indent=2))
         else:
             archive.writestr("classes.txt", "\n".join(classes) + ("\n" if classes else ""))
             pose = kind == "yolo-pose"
@@ -245,6 +265,69 @@ def _voc(image: dict, classes: list[str]) -> str:
         )
     parts.append("</annotation>")
     return "\n".join(parts) + "\n"
+
+
+def _rows(image: dict) -> list[tuple]:
+    rows = []
+    for shape in image.get("shapes") or []:
+        bounds = _shape_bounds(shape)
+        if not bounds:
+            continue
+        left, top, right, bottom = bounds
+        rows.append((shape.get("label") or "", left, top, max(0.0, right - left), max(0.0, bottom - top)))
+    return rows
+
+
+def _labelme(image: dict) -> dict:
+    shapes = []
+    for shape in image.get("shapes") or []:
+        points = shape.get("points") or []
+        pairs = [[float(points[index]), float(points[index + 1])] for index in range(0, len(points) - 1, 2)]
+        shapes.append({
+            "label": shape.get("label") or "",
+            "points": pairs,
+            "shape_type": "polygon" if shape.get("type") == "polygon" else "rectangle",
+        })
+    return {"version": "5.0.1", "imagePath": image.get("name") or "image.jpg", "shapes": shapes}
+
+
+def _csv(images: list[dict]) -> str:
+    lines = ["image,label,x,y,width,height"]
+    for image in images:
+        name = image.get("name") or "image.jpg"
+        for label, left, top, width, height in _rows(image):
+            lines.append(f"{name},{label},{left:.2f},{top:.2f},{width:.2f},{height:.2f}")
+    return "\n".join(lines) + "\n"
+
+
+def _kitti(image: dict) -> str:
+    lines = []
+    for label, left, top, width, height in _rows(image):
+        lines.append(f"{label} 0.00 0 0.00 {left:.2f} {top:.2f} {left + width:.2f} {top + height:.2f} 0.00 0.00 0.00 0.00 0.00 0.00 0.00")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _mot(images: list[dict]) -> str:
+    lines = []
+    for frame, image in enumerate(images, start=1):
+        for index, (label, left, top, width, height) in enumerate(_rows(image), start=1):
+            lines.append(f"{frame},{index},{left:.2f},{top:.2f},{width:.2f},{height:.2f},1,-1,-1,-1")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _client_json(output_format: str, images: list[dict]) -> dict:
+    return {
+        "format": output_format,
+        "images": [
+            {
+                "name": image.get("name"),
+                "width": image.get("width"),
+                "height": image.get("height"),
+                "shapes": image.get("shapes") or [],
+            }
+            for image in images
+        ],
+    }
 
 
 def _xml(value: str) -> str:

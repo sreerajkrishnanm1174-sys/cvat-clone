@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
+import secrets
 from pathlib import Path
 
 import httpx
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -16,11 +18,12 @@ from sqlalchemy.orm import Session
 from .config import Settings, get_settings
 from .cvat import CvatClient, CvatError
 
-from .db import Prediction, Run, Sample, init_db, make_engine, make_session_factory
+from .db import ClientFormat, Prediction, Run, Sample, init_db, make_engine, make_session_factory
 from .learning import MODE_TEXT, explain_profile, explain_rule, prompt_lessons
 from . import exporting, planning, report, service, spec
 from .vision import annotate_image
 from . import chat as agent_chat
+from . import custom_format
 from .service import get_project
 
 
@@ -43,6 +46,15 @@ class LearningSettingsIn(BaseModel):
 class AnnotateIn(BaseModel):
     task_id: int
     mode: str | None = None
+
+
+class CustomExportIn(BaseModel):
+    profile: dict | None = None
+    profile_id: int | None = None
+    task_id: int | None = None
+    job_id: int | None = None
+    save: bool = False
+    preview: bool = False
 
 
 class RollbackIn(BaseModel):
@@ -131,6 +143,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         for item in files or []:
             uploaded.append((item.filename or "file", item.file.read()))
         bundle = agent_chat.read_upload(uploaded, Path(settings.analyzer_data_dir))
+        project_key = int(project_id) if str(project_id or "").strip().isdigit() else None
+        if project_key and bundle.get("document_name"):
+            _store_requirement_copy(settings, project_key, bundle["document_name"])
         transcript = [item for item in previous if isinstance(item, dict)]
         context = []
         if str(project_id or "").strip().isdigit():
@@ -145,7 +160,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             text = agent_chat.reply(settings, client, session, transcript, bundle)
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"reply": text}
+        download = None
+        task_key = int(task_id) if str(task_id or "").strip().isdigit() else None
+        if project_key and _user_wants_custom_export(message):
+            text, download = _chat_export(settings, client, project_key, task_key, text, who["organization"])
+        return {"reply": text, "download": download}
+
+    @app.get("/exports/{token}")
+    def download_ready_export(
+        token: str,
+        who: dict = Depends(identity),
+    ) -> FileResponse:
+        if not re.fullmatch(r"[a-f0-9]{32}", token or ""):
+            raise HTTPException(status_code=404, detail="That export is not available")
+        folder = Path(settings.analyzer_data_dir) / "exports"
+        meta_path = folder / f"{token}.json"
+        file_path = folder / f"{token}.zip"
+        if not meta_path.exists() or not file_path.exists():
+            raise HTTPException(status_code=404, detail="That export is not available")
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("organization") != (who["organization"] or ""):
+            raise HTTPException(status_code=404, detail="That export is not available")
+        return FileResponse(file_path, media_type="application/zip", filename=meta.get("filename") or "client-format.zip")
 
     @app.get("/health")
     def health() -> dict:
@@ -487,6 +523,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         _, state = open_project(project_id, client, session, who["organization"])
         parsed = state.spec_json or {}
+        saved = _requirement_files(settings, project_id)
+        if saved:
+            profile = custom_format.analyze_files(saved)
+            if profile.get("ready"):
+                try:
+                    images = _client_images(client, project_id, task_id, job_id)
+                except CvatError as exc:
+                    raise HTTPException(status_code=exc.status, detail="CVAT could not read the annotations for this export") from exc
+                if profile.get("layout") == "hseg":
+                    _attach_frames(client, images)
+                project = client.get_project(project_id)
+                blob, report = custom_format.package(profile, str(project.get("name") or f"project-{project_id}"), images)
+                if blob is None:
+                    message = (report.get("errors") or ["The requirement format did not pass verification."])[0]
+                    return JSONResponse(status_code=422, content={"converted": False, "message": message, "report": report})
+                filename = f"project-{project_id}-client-format.zip"
+                return Response(
+                    blob,
+                    media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+                )
         output_format = parsed.get("output_format") or "CVAT"
         kind = exporting.export_kind(output_format)
         if not kind:
@@ -516,6 +573,77 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             media_type="application/zip",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
+
+    @app.post("/projects/{project_id}/custom-format/analyze")
+    def analyze_custom_format(
+        project_id: int,
+        files: list[UploadFile] | None = File(default=None),
+        who: dict = Depends(identity),
+        client: CvatClient = Depends(cvat_client),
+        session: Session = Depends(db),
+    ) -> dict:
+        open_project(project_id, client, session, who["organization"])
+        if files:
+            payload = [(item.filename or "requirement.txt", item.file.read()) for item in files]
+        else:
+            payload = _requirement_files(settings, project_id)
+        if not payload:
+            return {"profile": custom_format.analyze_files([]), "ready": False, "ambiguities": ["This project has no requirement document yet."]}
+        profile = custom_format.analyze_files(payload)
+        return {"profile": profile, "ready": bool(profile.get("ready")), "ambiguities": profile.get("ambiguities") or []}
+
+    @app.get("/projects/{project_id}/custom-format/profiles")
+    def list_custom_formats(
+        project_id: int,
+        who: dict = Depends(identity),
+        client: CvatClient = Depends(cvat_client),
+        session: Session = Depends(db),
+    ) -> dict:
+        open_project(project_id, client, session, who["organization"])
+        rows = session.scalars(
+            select(ClientFormat).where(ClientFormat.organization == (who["organization"] or "")).order_by(ClientFormat.id.desc())
+        ).all()
+        return {
+            "profiles": [
+                {"id": row.id, "name": row.name, "document_name": row.document_name, "version": row.version, "project_id": row.cvat_project_id}
+                for row in rows
+            ]
+        }
+
+    @app.post("/projects/{project_id}/custom-format/export")
+    def export_custom_format(
+        project_id: int,
+        body: CustomExportIn,
+        who: dict = Depends(identity),
+        client: CvatClient = Depends(cvat_client),
+        session: Session = Depends(db),
+    ):
+        project, _state = open_project(project_id, client, session, who["organization"])
+        profile = _load_custom_profile(session, body, project_id, who["organization"])
+        if body.save and body.profile and profile.get("ready"):
+            row = ClientFormat(
+                organization=who["organization"] or "",
+                cvat_project_id=project_id,
+                name=str(profile.get("name") or "Client format")[:160],
+                document_name=str(profile.get("document_name") or "")[:256],
+                profile_json=profile,
+            )
+            session.add(row)
+            session.flush()
+        try:
+            images = _client_images(client, project_id, body.task_id, body.job_id)
+        except CvatError as exc:
+            raise HTTPException(status_code=exc.status, detail="CVAT could not read the annotations for this export") from exc
+        if body.preview:
+            images = images[:2]
+        blob, report = custom_format.package(profile, str(project.get("name") or f"project-{project_id}"), images)
+        if blob is None:
+            return JSONResponse(status_code=422, content={"ready": False, "report": report})
+        if body.preview:
+            preview, _ = custom_format.convert_dataset(profile, str(project.get("name") or ""), images)
+            return {"ready": True, "report": report, "preview": preview}
+        filename = f"project-{project_id}-client-format.zip"
+        return Response(blob, media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
     @app.get("/projects/{project_id}/jobs/{job_id}/diff")
     def job_diff(
@@ -881,10 +1009,101 @@ def _client_images(client: CvatClient, project_id: int, task_id: int | None, job
                     "name": name,
                     "width": int(info.get("width") or 0),
                     "height": int(info.get("height") or 0),
+                    "task_id": task_key,
+                    "frame": frame,
                     "shapes": [_export_shape(shape, labels) for shape in grouped.get(frame, [])],
                 }
             )
     return images
+
+
+def _user_wants_custom_export(message: str) -> bool:
+    return bool(re.search(r"export|download|hseg|custom format|client format|json v1|format example", message or "", flags=re.I))
+
+
+def _store_requirement_copy(settings: Settings, project_id: int, document_name: str) -> None:
+    source = Path(settings.analyzer_data_dir) / "chat" / Path(document_name).name
+    if not source.is_file():
+        return
+    destination = Path(settings.analyzer_data_dir) / "uploads" / str(project_id)
+    destination.mkdir(parents=True, exist_ok=True)
+    target = destination / source.name
+    target.write_bytes(source.read_bytes())
+
+
+def _attach_frames(client: CvatClient, images: list[dict]) -> None:
+    for image in images:
+        if image.get("content") or image.get("task_id") is None or image.get("frame") is None:
+            continue
+        image["content"] = client.get_frame(int(image["task_id"]), int(image["frame"]))
+
+
+def _chat_export(settings: Settings, client: CvatClient, project_id: int, task_id: int | None, reply: str, organization: str) -> tuple[str, dict | None]:
+    saved = _requirement_files(settings, project_id)
+    profile = custom_format.analyze_files(saved)
+    if not profile.get("ready"):
+        reason = (profile.get("ambiguities") or ["The requirement example is not ready to convert."])[0]
+        return reason, None
+    try:
+        images = _client_images(client, project_id, task_id, None)
+        if profile.get("layout") == "hseg":
+            _attach_frames(client, images)
+        project = client.get_project(project_id)
+    except CvatError:
+        return "CVAT could not read the annotations for this export.", None
+    blob, report = custom_format.package(profile, str(project.get("name") or f"project-{project_id}"), images)
+    if blob is None:
+        return ((report.get("errors") or ["The client format did not pass verification."])[0]), None
+    token = secrets.token_hex(16)
+    folder = Path(settings.analyzer_data_dir) / "exports"
+    folder.mkdir(parents=True, exist_ok=True)
+    filename = f"project-{project_id}-{profile.get('layout') or 'client'}.zip"
+    (folder / f"{token}.zip").write_bytes(blob)
+    (folder / f"{token}.json").write_text(
+        json.dumps({"organization": organization or "", "filename": filename}),
+        encoding="utf-8",
+    )
+    message = f"Converted {report.get('converted') or 0} objects to {profile.get('name') or 'the client format'}. The file is downloading."
+    if re.search(r"can.?t|cannot|from here", reply or "", flags=re.I):
+        reply = message
+    elif message not in (reply or ""):
+        reply = (reply.rstrip() + " " + message).strip()
+    return reply, {"token": token, "filename": filename}
+
+
+def _requirement_files(settings: Settings, project_id: int) -> list[tuple[str, bytes]]:
+    folder = Path(settings.analyzer_data_dir) / "uploads" / str(project_id)
+    if not folder.exists():
+        return []
+    payload = []
+    for path in sorted(folder.iterdir(), key=lambda item: item.stat().st_mtime):
+        if path.is_file() and path.stat().st_size <= custom_format.MAX_BYTES:
+            payload.append((path.name, path.read_bytes()))
+    return payload
+
+
+def _attribute_map(shape: dict) -> dict:
+    raw = shape.get("attributes") or []
+    if isinstance(raw, dict):
+        values = {str(key): value for key, value in raw.items()}
+    else:
+        values = {}
+        for item in raw if isinstance(raw, list) else []:
+            if isinstance(item, dict) and item.get("name"):
+                values[str(item["name"])] = item.get("value")
+    values.setdefault("occluded", bool(shape.get("occluded")))
+    return values
+
+
+def _load_custom_profile(session: Session, body: CustomExportIn, project_id: int, organization: str) -> dict:
+    if body.profile_id:
+        row = session.get(ClientFormat, int(body.profile_id))
+        if row is None or row.organization != (organization or ""):
+            raise HTTPException(status_code=404, detail="That client format is not available in this organization")
+        return dict(row.profile_json or {})
+    if body.profile:
+        return dict(body.profile)
+    raise HTTPException(status_code=400, detail="Choose a saved client format or analyze a document first")
 
 
 def _export_shape(shape: dict, labels: dict[int, dict]) -> dict:
@@ -906,7 +1125,12 @@ def _export_shape(shape: dict, labels: dict[int, dict]) -> dict:
         "points": shape.get("points") or [],
         "elements": elements,
         "keypoint_order": [],
-    }
+        "id": shape.get("id"),
+        "source": shape.get("source") or "",
+            "occluded": bool(shape.get("occluded")),
+            "attributes": _attribute_map(shape),
+            "track_id": shape.get("track_id") or "",
+        }
 
 
 def learn_job(session: Session, client: CvatClient, state, job: dict, settings: Settings, event_key: str | None = None) -> int:

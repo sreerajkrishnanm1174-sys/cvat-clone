@@ -90,7 +90,7 @@ TOOLS = [
     },
     {
         "name": "update_requirement",
-        "description": "Change the saved requirement and the CVAT labels. Use this when the user wants labels removed, kept, renamed, retyped, or added, even if those labels are already in the requirement.",
+        "description": "Change the saved requirement and the CVAT labels. Use this when the user wants labels removed, kept, renamed, retyped, or added, or when they name the client export format, even if those labels are already in the requirement.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -124,6 +124,10 @@ TOOLS = [
                         "properties": {"name": {"type": "string"}, "type": {"type": "string"}},
                         "required": ["name", "type"],
                     },
+                },
+                "output_format": {
+                    "type": "string",
+                    "description": "The client delivery format named in chat, such as COCO, YOLO, VOC, LabelMe, CSV, KITTI, or MOT.",
                 },
             },
             "required": ["project_id"],
@@ -227,6 +231,7 @@ When the user asks about the project, call project_details and answer with the r
 When the user says something is wrong, or asks to change labels or the requirement, do it in this turn:
 - labels that are not in the requirement, or duplicates: call fix_labels
 - remove, keep, rename, or add labels, even when they are already in the requirement: call update_requirement, which changes the saved requirement and CVAT
+- the user names a client format, attaches an example, or asks to export or download: the server builds the zip from the requirement example. Tell them the file is downloading. Never say you cannot generate or download the export.
 - wrong shapes on a task: call clear_annotations, then annotate_task
 - a new requirement file is attached: call apply_requirement
 - image files are attached: call add_images on the current task, unless the user asked to replace the images or create a new task
@@ -349,6 +354,7 @@ def run_tool(name: str, arguments: dict, client: CvatClient, session, settings: 
                 rename=arguments.get("rename"),
                 add=arguments.get("add_labels"),
                 type_changes=arguments.get("type_changes"),
+                output_format=arguments.get("output_format"),
             )
             if not (state.spec_json or {}).get("labels") and not updated.get("labels"):
                 return "This project has no requirement yet. Attach the requirement document first."
@@ -358,6 +364,7 @@ def run_tool(name: str, arguments: dict, client: CvatClient, session, settings: 
             return json.dumps({
                 "project_id": project_id,
                 "labels": [item.get("name") for item in updated.get("labels") or []],
+                "output_format": updated.get("output_format") or "CVAT",
                 "applied": applied,
             })
         if name == "analyze_requirement":
@@ -563,6 +570,7 @@ def revise_spec(
     rename: list | None = None,
     add: list | None = None,
     type_changes: list | None = None,
+    output_format: str | None = None,
 ) -> dict:
     """Apply a chat instruction to the saved requirement labels."""
     updated = copy.deepcopy(parsed or {})
@@ -593,6 +601,8 @@ def revise_spec(
         labels.append({"name": name, "type": item.get("type") or "rectangle", "attributes": []})
         names.add(_label_key(name))
     updated["labels"] = labels
+    if output_format and str(output_format).strip():
+        updated["output_format"] = str(output_format).strip()
     return updated
 
 

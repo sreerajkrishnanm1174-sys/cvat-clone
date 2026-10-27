@@ -18,8 +18,8 @@ from .geometry import (
     box_size,
     crosses_self,
     iou,
-    resample_polygon,
     scale_outline,
+    simplify_polygon,
 )
 
 
@@ -247,7 +247,7 @@ def apply_profile_to_shape(shape: dict, profile: dict | None, label_type: str) -
             updated["points"] = scale_outline(updated["points"], float(scales[-1]["payload"]["scale"]))
         point_rules = learning.active_rules(profile, "polygon_points", label)
         if point_rules:
-            updated["points"] = resample_polygon(updated["points"], int(point_rules[-1]["payload"]["points"]))
+            updated["points"] = simplify_polygon(updated["points"])
     for rule in learning.active_rules(profile, "attribute_default", updated["label"]):
         name = rule["payload"]["name"]
         updated["attributes"].setdefault(name, rule["payload"]["value"])

@@ -104,6 +104,22 @@ class WebhookEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class ClientFormat(Base):
+    """A reusable client output profile. Scoped to one CVAT organization."""
+
+    __tablename__ = "client_formats"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    organization: Mapped[str] = mapped_column(String(64), default="", index=True)
+    cvat_project_id: Mapped[int] = mapped_column(Integer, index=True)
+    name: Mapped[str] = mapped_column(String(160), default="Client format")
+    document_name: Mapped[str] = mapped_column(String(256), default="")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    profile_json: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_log"
 

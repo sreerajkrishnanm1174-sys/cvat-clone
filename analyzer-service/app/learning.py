@@ -356,8 +356,8 @@ def explain_rule(rule: dict) -> str:
         return prefix + f"Your boxes for {label} are {fit} than the agent's, so it now draws them that way."
     if kind == "polygon_points":
         return prefix + (
-            f"You place about {payload.get('points')} points on a {label} outline, "
-            "so the agent matches that spacing."
+            f"On {label}, keep a point where the outline turns and drop points that sit on a straight edge. "
+            "Do not reuse one point count for every object."
         )
     if kind == "outline_scale":
         scale = float(payload.get("scale") or 1)
