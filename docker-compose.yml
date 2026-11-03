@@ -99,7 +99,7 @@ services:
       ADAPTIVE_AUTO_ANNOTATION: 'false'
       NUMPROCS: 2
       CVAT_ANALYTICS: 1
-      CVAT_NUCLIO_INVOKE_METHOD: dashboard
+      CVAT_NUCLIO_INVOKE_METHOD: direct
       CVAT_BASE_URL:
       ONE_RUNNING_JOB_IN_QUEUE_PER_USER:
     command: init run server nginx
@@ -107,7 +107,7 @@ services:
       traefik.enable: "true"
       traefik.http.services.cvat.loadbalancer.server.port: "8080"
       traefik.http.routers.cvat.rule:
-        Host(`${CVAT_HOST:-localhost}`) &&
+        HostRegexp(`^.+`) &&
         (PathPrefix(`/api/`) || PathPrefix(`/static/`) || PathPrefix(`/admin`)
           || PathPrefix(`/django-rq`))
       traefik.http.routers.cvat.entrypoints: web
@@ -262,7 +262,7 @@ services:
     labels:
       traefik.enable: "true"
       traefik.http.services.cvat-ui.loadbalancer.server.port: "8000"
-      traefik.http.routers.cvat-ui.rule: Host(`${CVAT_HOST:-localhost}`)
+      traefik.http.routers.cvat-ui.rule: HostRegexp(`^.+`)
       traefik.http.routers.cvat-ui.entrypoints: web
     networks:
       - cvat
@@ -272,8 +272,8 @@ services:
     container_name: traefik
     restart: always
     ports:
-      - 8080:8080
-      - 8090:8090
+      - ${CVAT_BIND:-0.0.0.0}:8080:8080
+      - ${CVAT_BIND:-0.0.0.0}:8090:8090
     environment:
       CVAT_HOST: ${CVAT_HOST:-localhost}
       DJANGO_LOG_VIEWER_HOST: grafana

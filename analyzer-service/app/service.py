@@ -435,6 +435,14 @@ def to_cvat_shape(shape: dict, label_ids: dict[str, dict], frame: int) -> dict |
     }
     if shape["type"] not in {"rectangle", "ellipse"}:
         payload.pop("rotation", None)
+    if shape["type"] == "mask":
+        # CVAT masks are run lengths plus a box, not polygon coordinates.
+        from .refine import polygon_to_cvat_mask
+
+        rle = polygon_to_cvat_mask(list(shape.get("points") or []), 100000, 100000)
+        if not rle:
+            return None
+        payload["points"] = rle
     if shape["type"] == "skeleton":
         sublabels = {item["name"]: item for item in label.get("sublabels") or []}
         elements = []

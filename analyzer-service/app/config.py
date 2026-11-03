@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/analyzer.sqlite3"
     redis_url: str = "redis://localhost:6379/0"
     analyzer_data_dir: str = "./data"
+    annotation_refine: bool = True
     analyzer_root_path: str = ""
     analyzer_webhook_url: str = ""
 

@@ -34,7 +34,7 @@ services:
       ANALYZER_WEBHOOK_URL: http://analyzer:8090/webhooks/cvat
       ANALYZER_DATA_DIR: /data
     ports:
-      - "8095:8090"
+      - "${CVAT_BIND:-0.0.0.0}:8095:8090"
     volumes:
       - analyzer_data:/data
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -44,7 +44,7 @@ services:
     labels:
       - traefik.enable=true
       - traefik.docker.network=cvat_cvat
-      - traefik.http.routers.analyzer.rule=Host(`localhost`) && PathPrefix(`/analyzer`)
+      - traefik.http.routers.analyzer.rule=HostRegexp(`^.+`) && PathPrefix(`/analyzer`)
       - traefik.http.routers.analyzer.priority=200
       - traefik.http.routers.analyzer.entrypoints=web
       - traefik.http.middlewares.analyzer-strip.stripprefix.prefixes=/analyzer

@@ -953,7 +953,9 @@ def _detect(client, settings: Settings, task_id: int, frame: int, labels: list[d
         return []
     image = client.get_frame(task_id, frame)
     try:
-        raw = annotate_image(settings.anthropic_api_key, settings.anthropic_model, image, labels, lessons or [])
+        raw = annotate_image(
+            settings.anthropic_api_key, settings.anthropic_model, image, labels, lessons or [], refine=settings.annotation_refine
+        )
     except Exception as exc:
         _detect_error = str(exc)[:240]
         return []

@@ -27,14 +27,17 @@ rules, and general guidelines. Find every object that matches a label and return
 Coordinates are pixels in the image you were given (origin top-left).
 By label annotation_type:
 - bounding_box: bbox only.
-- polygon and mask: bbox plus polygon. Trace the visible silhouette. Put a point only where the
-  edge turns. A straight edge has its two corners and nothing between them. A curve or a bend gets
-  more points. The count must change with the object. Never reuse one point count, and never return
-  a rectangle made from the bbox.
-- points: one keypoint for each name in keypoints.
-- skeleton: one keypoint for EVERY name in keypoints. v=2 when the joint is visible,
-  v=1 when it is hidden but its position can be estimated, v=0 when it is not in the image
-  (use x=0 and y=0). Do not skip a name.
+- polygon and mask: bbox plus polygon. Trace the visible silhouette tightly: the points must lie ON the
+  object's edge, not outside it and not cut through it. Put a point only where the edge turns. A straight
+  edge has its two corners and nothing between them. A curve or a bend gets more points. The count must
+  change with the object. Never reuse one point count, and never return a rectangle made from the bbox.
+  Go around the outline in one direction without crossing itself.
+- points: bbox of the subject plus one keypoint for each name in keypoints.
+- skeleton: bbox of the whole subject plus one keypoint for EVERY name in keypoints. Place each point at
+  the center of the joint or part, not on the body edge. left/right is the subject's own left/right, not
+  the viewer's. v=2 when the joint is visible, v=1 when it is hidden but its position can be estimated,
+  v=0 when it is not in the image (use x=0 and y=0). Do not skip a name, and do not guess a position for a
+  joint that is outside the frame.
 Follow each label's include/exclude/min_size_px and how_to_decide. Do not invent objects: if a
 label is not visible, return nothing for it. Prefer fewer, correct annotations.
 When the prompt contains "Corrections from earlier images in this project", apply those corrections
@@ -128,6 +131,7 @@ def parse_shapes(text: str, labels: list[dict], scale: float, width: int, height
                     "type": "skeleton",
                     "points": [],
                     "elements": elements,
+                    "hint_bbox": _scaled_bbox(item, scale, width, height),
                     "attributes": item.get("attributes") if isinstance(item.get("attributes"), dict) else {},
                     "score": _score(item),
                 }
@@ -137,7 +141,8 @@ def parse_shapes(text: str, labels: list[dict], scale: float, width: int, height
         kind = label.get("type") if label.get("type") in supported else None
         if kind is None:
             continue
-        raw_points = _reference_points(item, kind) or item.get("points") or []
+        raw_points = _keypoint_pairs(item) if kind == "points" else []
+        raw_points = raw_points or _reference_points(item, kind) or item.get("points") or []
         if raw_points and isinstance(raw_points[0], (list, tuple)):
             flat = []
             for pair in raw_points:
@@ -185,6 +190,7 @@ def annotate_image(
     image: bytes,
     labels: list[dict],
     lessons: list[str],
+    refine: bool = True,
 ) -> list[dict]:
     if not api_key:
         raise VisionError("No vision API key is configured.")
@@ -233,13 +239,32 @@ def annotate_image(
             shapes = _refine_polygons(
                 api_key, name, encoded, media_type, labels, lessons, scale, width, height, shapes,
             )
+        if refine and shapes:
+            from .refine import refine_shapes
+
+            def ask(system: str, content: list) -> str:
+                reply = httpx.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": api_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={"model": name, "max_tokens": 3000, "system": system, "messages": [{"role": "user", "content": content}]},
+                    timeout=120,
+                )
+                if reply.status_code >= 400:
+                    raise VisionError(f"The vision model returned HTTP {reply.status_code}.")
+                return "".join(b.get("text") or "" for b in reply.json().get("content") or [] if b.get("type") == "text")
+
+            shapes = refine_shapes(image, shapes, labels, ask)
         return shapes
     raise VisionError(last_error)
 
 
 def _scaled_point(x: float, y: float, scale: float, width: int, height: int) -> tuple[float, float]:
     if max(abs(x), abs(y)) <= 1.5 and (x or y):
-        return x * width, y * height
+        return x * width * scale, y * height * scale
     return x * scale, y * scale
 
 
@@ -276,6 +301,34 @@ def _skeleton_elements(item: dict, names: list[str], scale: float, width: int, h
         x, y = _scaled_point(x, y, scale, width, height)
         elements.append({"label": name, "points": [round(x, 2), round(y, 2)], "outside": False, "occluded": visible == 1})
     return elements
+
+
+def _scaled_bbox(item: dict, scale: float, width: int, height: int) -> list[float] | None:
+    box = item.get("bbox")
+    if not (isinstance(box, list) and len(box) >= 4):
+        return None
+    try:
+        values = [float(v) for v in box[:4]]
+    except (TypeError, ValueError):
+        return None
+    if max(abs(v) for v in values) <= 1.5:
+        return [values[0] * width * scale, values[1] * height * scale, values[2] * width * scale, values[3] * height * scale]
+    return [v * scale for v in values]
+
+
+def _keypoint_pairs(item: dict) -> list:
+    """A points label is its keypoints. The bbox corners are not points of the object."""
+    pairs_out = []
+    for point in item.get("keypoints") or []:
+        if not isinstance(point, dict):
+            continue
+        try:
+            if int(point.get("v", 2)) <= 0:
+                continue
+            pairs_out.append([float(point["x"]), float(point["y"])])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return pairs_out
 
 
 def _reference_points(item: dict, kind: str) -> list:
