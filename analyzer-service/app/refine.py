@@ -53,19 +53,38 @@ def refine_shapes(image: bytes, shapes: list[dict], labels: list[dict], ask: Ask
     if img is None:
         return shapes
     by_name = {str(item.get("name")): item for item in labels}
+    traced = {}
+    if any(shape.get("type") in {"polygon", "mask"} for shape in shapes):
+        try:
+            from .segment import trace_polygons
+
+            traced = trace_polygons(image, shapes)
+        except Exception as exc:
+            log.warning("SAM outlines were not used: %s", exc)
     out: list[dict] = []
     skeletons = 0
-    for shape in shapes:
+    for index, shape in enumerate(shapes):
         try:
-            if shape.get("type") == "polygon":
-                fitted = fit_outline(img, shape.get("points") or [])
-                if fitted:
+            if shape.get("type") in {"polygon", "mask"}:
+                if index in traced:
+                    out.extend(traced[index])
+                    continue
+                points = shape.get("points") or []
+                # A detection box is not an outline. Leave it out instead of drawing the diagonal.
+                if shape.get("type") == "mask" or len(points) < 6 or outline_is_template(points):
+                    continue
+                fitted = fit_outline(img, points)
+                if fitted and not outline_is_template(fitted):
                     shape = {**shape, "points": fitted}
+                else:
+                    continue
             elif shape.get("type") == "skeleton" and ask is not None and skeletons < max_skeletons:
                 skeletons += 1
                 shape = refine_skeleton(img, shape, by_name.get(str(shape.get("label"))) or {}, ask)
         except Exception as exc:  # a bad refinement must never lose the first-pass shape
             log.warning("refinement skipped for %s: %s", shape.get("label"), exc)
+            if shape.get("type") in {"polygon", "mask"}:
+                continue
         out.append(shape)
     return out
 

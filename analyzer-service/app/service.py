@@ -234,6 +234,8 @@ def apply_profile_to_shape(shape: dict, profile: dict | None, label_type: str) -
     }
     if shape.get("elements"):
         updated["elements"] = shape["elements"]
+    if shape.get("encoded"):
+        updated["encoded"] = shape["encoded"]
     for rule in learning.active_rules(profile, "label_confusion", label):
         updated["label"] = rule["payload"]["to"]
         label = updated["label"]
@@ -261,6 +263,12 @@ def apply_profile_to_shape(shape: dict, profile: dict | None, label_type: str) -
     return updated
 
 
+def _measured_geometry(shape: dict) -> tuple[list, str]:
+    if shape.get("encoded") == "rle":
+        return list(shape.get("points") or [])[-4:], "rectangle"
+    return list(shape.get("points") or []), shape.get("type") or "rectangle"
+
+
 def review_reasons(shape: dict, profile: dict | None, label_spec: dict | None, weak_track: bool = False) -> list[str]:
     reasons = []
     label = shape.get("label")
@@ -275,12 +283,15 @@ def review_reasons(shape: dict, profile: dict | None, label_spec: dict | None, w
     if any(rule.get("status") == "conflict" and rule.get("kind") == "label_confusion" and rule.get("label") == label for rule in (profile or {}).get("rules") or []):
         reasons.append(f"{label} looks like another label, so a person should check it")
     for rule in learning.active_rules(profile, "size_range", label):
-        width, height = box_size(shape.get("points") or [], shape.get("type") or "rectangle")
+        measure_points, measure_type = _measured_geometry(shape)
+        width, height = box_size(measure_points, measure_type)
         payload = rule["payload"]
         if width < payload["min_width"] * 0.5 or width > payload["max_width"] * 1.5:
             reasons.append(f"This {label} is outside the usual size")
         elif height < payload["min_height"] * 0.5 or height > payload["max_height"] * 1.5:
             reasons.append(f"This {label} is outside the usual size")
+    if shape.get("review"):
+        reasons.append(str(shape["review"]))
     if shape.get("type") == "polygon" and crosses_self(shape.get("points") or []):
         reasons.append("The outline crosses itself")
     if weak_track:
@@ -304,12 +315,9 @@ def associate_by_iou(frames: dict[int, list[dict]], minimum: float = 0.3) -> dic
             best = minimum
             if previous:
                 for prior in previous:
-                    score = iou(
-                        prior.get("points") or [],
-                        prior.get("type") or "rectangle",
-                        item.get("points") or [],
-                        item.get("type") or "rectangle",
-                    )
+                    prior_points, prior_type = _measured_geometry(prior)
+                    item_points, item_type = _measured_geometry(item)
+                    score = iou(prior_points, prior_type, item_points, item_type)
                     if score > best and prior.get("label") == item.get("label"):
                         best = score
                         match = prior
@@ -390,6 +398,8 @@ def shapes_for_labels(
     labels: list[dict],
     profile: dict | None,
 ) -> list[dict]:
+    from .detect import match_label
+
     by_name = {label["name"].lower(): label for label in labels}
     aliases = {}
     for label in labels:
@@ -398,7 +408,7 @@ def shapes_for_labels(
     kept = []
     for shape in raw:
         detected = (shape.get("label") or "").lower()
-        label = by_name.get(detected) or aliases.get(detected)
+        label = by_name.get(detected) or aliases.get(detected) or match_label(detected, labels)
         if label is None:
             continue
         adapted = apply_profile_to_shape(
@@ -435,14 +445,19 @@ def to_cvat_shape(shape: dict, label_ids: dict[str, dict], frame: int) -> dict |
     }
     if shape["type"] not in {"rectangle", "ellipse"}:
         payload.pop("rotation", None)
-    if shape["type"] == "mask":
-        # CVAT masks are run lengths plus a box, not polygon coordinates.
-        from .refine import polygon_to_cvat_mask
+    if shape["type"] == "polygon":
+        from .geometry import outline_is_template
+        from .segment import _artificial_diagonal
 
-        rle = polygon_to_cvat_mask(list(shape.get("points") or []), 100000, 100000)
-        if not rle:
+        points = shape.get("points") or []
+        if len(points) < 6 or outline_is_template(points) or _artificial_diagonal(points) or crosses_self(points):
             return None
-        payload["points"] = rle
+    if shape["type"] == "mask":
+        # Only a SAM mask already stored as CVAT run lengths is saved.
+        # Filling the detection box here draws the diagonal across the person.
+        if shape.get("encoded") != "rle" or len(shape.get("points") or []) < 5:
+            return None
+        payload["points"] = [float(value) for value in shape["points"]]
     if shape["type"] == "skeleton":
         sublabels = {item["name"]: item for item in label.get("sublabels") or []}
         elements = []

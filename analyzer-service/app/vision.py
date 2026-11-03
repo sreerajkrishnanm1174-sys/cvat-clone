@@ -27,11 +27,8 @@ rules, and general guidelines. Find every object that matches a label and return
 Coordinates are pixels in the image you were given (origin top-left).
 By label annotation_type:
 - bounding_box: bbox only.
-- polygon and mask: bbox plus polygon. Trace the visible silhouette tightly: the points must lie ON the
-  object's edge, not outside it and not cut through it. Put a point only where the edge turns. A straight
-  edge has its two corners and nothing between them. A curve or a bend gets more points. The count must
-  change with the object. Never reuse one point count, and never return a rectangle made from the bbox.
-  Go around the outline in one direction without crossing itself.
+- polygon and mask: bbox only. Tight box around the visible object. The silhouette is traced from the
+  image afterwards, so do not invent polygon points and do not turn the box into a triangle.
 - points: bbox of the subject plus one keypoint for each name in keypoints.
 - skeleton: bbox of the whole subject plus one keypoint for EVERY name in keypoints. Place each point at
   the center of the joint or part, not on the body edge. left/right is the subject's own left/right, not
@@ -192,8 +189,65 @@ def annotate_image(
     lessons: list[str],
     refine: bool = True,
 ) -> list[dict]:
-    if not api_key:
-        raise VisionError("No vision API key is configured.")
+    from .detect import as_detection_box, dedupe_shapes, detector_shapes, labels_needing_vision
+
+    detected: list[dict] = []
+    try:
+        detected = detector_shapes(image, labels)
+    except Exception as exc:
+        log_detect(exc)
+    pending = labels_needing_vision(labels, detected) if detected else list(labels)
+    vision: list[dict] = []
+    if pending:
+        if not api_key and not detected:
+            raise VisionError("No vision API key is configured.")
+        if api_key:
+            vision = _ask_vision(api_key, model, image, pending, lessons, refine=False)
+            if refine:
+                vision = [as_detection_box(shape) for shape in vision]
+    shapes = dedupe_shapes(detected + vision)
+    if not refine or not shapes:
+        return shapes
+    from .refine import refine_shapes
+
+    def ask(system: str, content: list) -> str:
+        reply = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": model,
+                "max_tokens": 3000,
+                "system": system,
+                "messages": [{"role": "user", "content": content}],
+            },
+            timeout=120,
+        )
+        if reply.status_code >= 400:
+            raise VisionError(f"The vision model returned HTTP {reply.status_code}.")
+        return "".join(block.get("text") or "" for block in reply.json().get("content") or [] if block.get("type") == "text")
+
+    traced = refine_shapes(image, shapes, labels, ask if api_key else None)
+    return dedupe_shapes(traced)
+
+
+def log_detect(exc: Exception) -> None:
+    import logging
+
+    logging.getLogger(__name__).warning("detector skipped: %s", exc)
+
+
+def _ask_vision(
+    api_key: str,
+    model: str,
+    image: bytes,
+    labels: list[dict],
+    lessons: list[str],
+    refine: bool = True,
+) -> list[dict]:
     payload, media_type, scale, width, height = prepare_image(image)
     prompt = build_prompt(labels, lessons, width, height)
     import base64
@@ -235,7 +289,7 @@ def annotate_image(
             raise VisionError(f"The vision model returned HTTP {response.status_code}.")
         text = "".join(block.get("text") or "" for block in response.json().get("content") or [] if block.get("type") == "text")
         shapes = parse_shapes(text, labels, scale, width, height)
-        if _coarse_polygons(shapes):
+        if refine and _coarse_polygons(shapes):
             shapes = _refine_polygons(
                 api_key, name, encoded, media_type, labels, lessons, scale, width, height, shapes,
             )

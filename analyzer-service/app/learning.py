@@ -63,6 +63,15 @@ def _attrs(shape: dict) -> dict:
     return {str(item.get("name")): str(item.get("value")) for item in raw if item.get("name")}
 
 
+def _compare_geometry(shape: dict) -> tuple[list, str]:
+    """A CVAT mask is stored as run lengths plus a box. Compare the box, not the run lengths."""
+    points = list(shape.get("points") or [])
+    kind = shape.get("type") or "rectangle"
+    if kind == "mask" and len(points) >= 4:
+        return points[-4:], "rectangle"
+    return points, kind
+
+
 def classify_frame(snapshot: list[dict], final: list[dict]) -> list[dict]:
     """Split a finished frame into human, correction, untouched, or imported samples."""
     used: set[int] = set()
@@ -73,12 +82,7 @@ def classify_frame(snapshot: list[dict], final: list[dict]) -> list[dict]:
         for index, shape in enumerate(final):
             if index in used or shape.get("source") == "file":
                 continue
-            score = iou(
-                pred.get("points") or [],
-                pred.get("type") or "rectangle",
-                shape.get("points") or [],
-                shape.get("type") or "rectangle",
-            )
+            score = iou(*_compare_geometry(pred), *_compare_geometry(shape))
             if score > best_iou:
                 best_iou = score
                 best = index
@@ -315,11 +319,11 @@ def derive_profile(samples: list[dict], spec: dict | None) -> dict:
             float(row["agent"]["score"]) for row in rejected if row["agent"].get("score") is not None
         ]
         kept_vals = [float(row["agent"]["score"]) for row in kept if row["agent"].get("score") is not None]
-        if not rejected_scores:
+        if not rejected_scores or not kept_vals:
             continue
-        cutoff = max(rejected_scores)
-        if kept_vals:
-            cutoff = (max(rejected_scores) + min(kept_vals)) / 2
+        if max(rejected_scores) >= min(kept_vals):
+            continue
+        cutoff = (max(rejected_scores) + min(kept_vals)) / 2
         rules.append(
             _rule(
                 "confidence_cutoff",

@@ -4,6 +4,7 @@ import json
 import math
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
@@ -296,6 +297,26 @@ def test_three_corrections_on_two_images_become_a_rule():
     assert any("left +5px" in lesson and "car" in lesson for lesson in lessons)
 
 
+def test_deleted_masks_do_not_hide_every_later_detection():
+    rle = [0, 40, 8, 80, 0.0, 0.0, 10.0, 20.0]
+    items = classify_frame(
+        [{"label": "human", "type": "mask", "points": [0, 0, 10, 20], "score": 0.9}],
+        [{"label": "human", "type": "mask", "points": rle, "source": "auto"}],
+    )
+    assert items[0]["role"] != "deleted"
+    samples = []
+    for image in ("a", "b"):
+        for _ in range(3):
+            samples.append(
+                {
+                    "frame_key": image,
+                    "items": [{"role": "deleted", "agent": {"label": "human", "type": "mask", "points": [0, 0, 10, 20], "score": 0.94}}],
+                }
+            )
+    profile = derive_profile(samples, {"labels": [{"name": "human", "type": "mask"}]})
+    assert not any(rule["kind"] == "confidence_cutoff" for rule in profile["rules"])
+
+
 def test_one_drawing_does_not_become_a_rule():
     samples = [
         {
@@ -389,6 +410,93 @@ def test_correction_changes_the_next_box_and_point_count():
     for step in range(8):
         circle.extend((math.cos(step * math.pi / 4) * 30, math.sin(step * math.pi / 4) * 30))
     assert outline_is_template(circle)
+
+
+def test_mask_contour_follows_the_object_and_keeps_separate_parts():
+    cv2 = pytest.importorskip("cv2")
+    numpy = pytest.importorskip("numpy")
+    from app.segment import mask_to_polygons
+
+    mask = numpy.zeros((80, 120), numpy.uint8)
+    cv2.ellipse(mask, (40, 40), (28, 16), 0, 0, 360, 1, -1)
+    cv2.circle(mask, (100, 20), 12, 1, -1)
+    high = mask_to_polygons(mask, 120, 80, "high")
+    optimized = mask_to_polygons(mask, 120, 80, "optimized")
+    assert len(high) == 2
+    assert max(len(item) for item in high) > max(len(item) for item in optimized)
+    for polygon in high:
+        assert len(polygon) // 2 >= 6
+        assert all(0 <= x < 120 and 0 <= y < 80 for x, y in zip(polygon[0::2], polygon[1::2]))
+    assert mask_to_polygons(numpy.zeros((20, 20), numpy.uint8), 20, 20) == []
+    from app.segment import _place_decoder_mask
+
+    crop = numpy.zeros((5, 4), numpy.uint8)
+    crop[1:4, 1:3] = 1
+    placed = _place_decoder_mask(crop, 10, 8, 30, 20)
+    assert placed.shape == (20, 30)
+    assert int(placed.sum()) == 6
+    assert placed[9, 11] == 1
+    from app.segment import _artificial_diagonal, _decode_cvat_rle, binary_to_cvat_rle
+    from app.service import to_cvat_shape
+
+    person = numpy.zeros((60, 40), numpy.uint8)
+    cv2.ellipse(person, (20, 12), (8, 8), 0, 0, 360, 1, -1)
+    cv2.rectangle(person, (14, 18), (26, 40), 1, -1)
+    cv2.rectangle(person, (16, 40), (20, 55), 1, -1)
+    cv2.rectangle(person, (22, 40), (26, 54), 1, -1)
+    rle = binary_to_cvat_rle(person)
+    assert rle is not None
+    assert int((_decode_cvat_rle(rle, 40, 60) != person).sum()) == 0
+    saved = to_cvat_shape(
+        {"label": "human", "type": "mask", "points": rle, "encoded": "rle"},
+        {"human": {"id": 9, "name": "human", "attributes": []}},
+        11,
+    )
+    assert saved["type"] == "mask"
+    assert saved["points"] == [float(value) for value in rle]
+    assert to_cvat_shape(
+        {"label": "human", "type": "mask", "points": [320, 428, 550, 768]},
+        {"human": {"id": 9, "name": "human", "attributes": []}},
+        11,
+    ) is None
+    assert _artificial_diagonal([10, 10, 40, 10, 40, 80]) is True
+    assert review_reasons({"label": "person", "type": "polygon", "points": [0, 0, 2, 0, 1, 2], "review": "Check the outline."}, None, None) == ["Check the outline."]
+
+
+def test_detector_names_match_task_labels_and_drop_duplicates():
+    from app.detect import dedupe_shapes, is_detector_label, labels_needing_vision, match_label
+    from app.service import shapes_for_labels, to_cvat_shape
+
+    labels = [
+        {"name": "human", "type": "mask"},
+        {"name": "vehicle", "type": "polygon", "detect_as": ["car", "truck"]},
+        {"name": "pothole", "type": "polygon"},
+    ]
+    assert match_label("person", labels)["name"] == "human"
+    assert match_label("car", labels)["name"] == "vehicle"
+    assert match_label("motorcycle", labels) is None
+    assert match_label("pothole", labels)["name"] == "pothole"
+    assert is_detector_label(labels[0]) and not is_detector_label(labels[2])
+    found = [{"label": "human", "type": "mask", "points": [0, 0, 10, 40], "score": 0.9}]
+    pending = labels_needing_vision(labels, found)
+    assert [item["name"] for item in pending] == ["vehicle", "pothole"]
+    boxes = [
+        {"label": "human", "type": "mask", "points": [0, 0, 10, 40], "score": 0.9},
+        {"label": "human", "type": "mask", "points": [1, 1, 11, 41], "score": 0.4},
+        {"label": "human", "type": "mask", "points": [80, 0, 100, 40], "score": 0.8},
+    ]
+    assert len(dedupe_shapes(boxes)) == 2
+    adapted = shapes_for_labels(
+        [{"label": "person", "type": "mask", "points": [0, 0, 10, 40], "score": 0.8}],
+        labels,
+        None,
+    )
+    assert adapted[0]["label"] == "human"
+    assert to_cvat_shape(
+        {"label": "vehicle", "type": "polygon", "points": [0, 0, 10, 0, 10, 10, 0, 10]},
+        {"vehicle": {"id": 1, "name": "vehicle", "attributes": []}},
+        0,
+    ) is None
 
 
 def test_classification_does_not_double_count():
