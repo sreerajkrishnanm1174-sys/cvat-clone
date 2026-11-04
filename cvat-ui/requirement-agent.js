@@ -230,7 +230,7 @@
       "<section class='ra-card'><div class='ra-card-head'><h3>Projects</h3><button class='ra-btn' id='ra-new-toggle' type='button'>New project</button></div><p class='ra-muted' id='ra-list-copy'>Loading your projects…</p><div id='ra-project-list'></div><div id='ra-new' class='ra-field' hidden><input id='ra-new-name' type='text' placeholder='Project name' aria-label='Project name'/><label class='ra-file'><span id='ra-new-file-label'>Requirement document</span><input id='ra-new-file' type='file' accept='.pdf,.docx,.txt,.md'/></label><button class='ra-btn primary' id='ra-new-create' type='button'>Create project</button><div class='ra-status' id='ra-new-status' hidden></div></div></section>",
       "<section class='ra-card' id='ra-detail'><div class='ra-card-head'><h3>This project</h3></div><p class='ra-muted' id='ra-project-copy'>Select a project. The agent reads its requirement and explains the tool, the drawing method, and the decision for each label.</p><div id='ra-labels'></div><div id='ra-guide'></div><div id='ra-tasks'></div><p class='ra-muted' id='ra-learning'></p><label class='ra-switch'><input id='ra-learn' type='checkbox'/> Learn from this project's corrections</label></section>",
       "<section class='ra-card'><div class='ra-card-head'><h3>Requirement</h3></div><p class='ra-muted'>Upload the client document. The agent reads it and sets up the labels for this project.</p><div class='ra-actions'><label class='ra-file'><span>Upload requirement</span><input id='ra-file' type='file' accept='.pdf,.docx,.txt,.md'/></label><button class='ra-btn' id='ra-analyze' type='button'>Analyze requirement</button><button class='ra-btn' id='ra-apply' type='button'>Apply labels</button></div><div class='ra-status' id='ra-req-status' hidden></div></section>",
-      "<section class='ra-card'><div class='ra-card-head'><h3>Task in this project</h3></div><p class='ra-muted'>Choose the images, then create the task. Auto-annotation starts only after CVAT has imported those images.</p><div class='ra-field'><input id='ra-task-name' type='text' placeholder='Task name' aria-label='Task name'/><label class='ra-file'><span id='ra-task-file-label'>Choose images</span><input id='ra-task-images' type='file' accept='image/*,.zip,.jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff' multiple/></label><p class='ra-muted' id='ra-task-file-note' hidden>No images chosen.</p><button class='ra-btn primary' id='ra-task-create' type='button'>Create task</button><div class='ra-status' id='ra-task-status' hidden></div><select id='ra-task-choose' aria-label='Choose a task'><option value=''>No task selected</option></select><div class='ra-split'><button class='ra-btn primary' id='ra-open-tool' type='button'>Open in tool</button><button class='ra-btn' id='ra-annotate' type='button'>Annotate this task</button><button class='ra-btn wide' id='ra-sync' type='button'>Learn from my corrections</button></div><p class='ra-muted'>Add keeps the current images. Replace removes them.</p><label class='ra-file'><span id='ra-more-file-label'>Images to add or replace</span><input id='ra-more-images' type='file' accept='image/*,.zip,.jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff' multiple/></label><p class='ra-muted' id='ra-more-note' hidden>No images chosen.</p><div class='ra-split'><button class='ra-btn primary' id='ra-images-add' type='button'>Add to current images</button><button class='ra-btn' id='ra-images-replace' type='button'>Replace current images</button></div></div></section>",
+      "<section class='ra-card'><div class='ra-card-head'><h3>Task in this project</h3></div><p class='ra-muted'>Choose images or one video, then create the task. Auto-annotation starts only after CVAT has imported the file.</p><div class='ra-field'><input id='ra-task-name' type='text' placeholder='Task name' aria-label='Task name'/><label class='ra-file'><span id='ra-task-file-label'>Choose images or a video</span><input id='ra-task-images' type='file' accept='image/*,video/*,.zip,.jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff,.mp4,.mov,.avi,.mkv,.webm,.mpeg,.mpg,.m4v' multiple/></label><p class='ra-muted' id='ra-task-file-note' hidden>No images chosen.</p><button class='ra-btn primary' id='ra-task-create' type='button'>Create task</button><div class='ra-status' id='ra-task-status' hidden></div><select id='ra-task-choose' aria-label='Choose a task'><option value=''>No task selected</option></select><div class='ra-split'><button class='ra-btn primary' id='ra-open-tool' type='button'>Open in tool</button><button class='ra-btn' id='ra-annotate' type='button'>Annotate this task</button><select id='ra-shape' aria-label='Annotation shape'><option value='auto'>Automatic shape</option><option value='rectangle'>Rectangle</option><option value='polygon'>Polygon</option><option value='mask'>Mask</option><option value='polyline'>Polyline</option><option value='points'>Points</option><option value='ellipse'>Ellipse</option><option value='skeleton'>Skeleton</option></select><button class='ra-btn wide' id='ra-sync' type='button'>Learn from my corrections</button></div><p class='ra-muted'>Add keeps the current images. Replace removes them.</p><label class='ra-file'><span id='ra-more-file-label'>Images to add or replace</span><input id='ra-more-images' type='file' accept='image/*,.zip,.jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff' multiple/></label><p class='ra-muted' id='ra-more-note' hidden>No images chosen.</p><div class='ra-split'><button class='ra-btn primary' id='ra-images-add' type='button'>Add to current images</button><button class='ra-btn' id='ra-images-replace' type='button'>Replace current images</button></div></div></section>",
       "</div></div>",
     ].join("");
     document.body.appendChild(panel);
@@ -248,7 +248,7 @@
       var note = document.getElementById("ra-task-file-note");
       var text = files.length
         ? files.length + " file(s): " + files.slice(0, 3).map(function (file) { return file.name; }).join(", ")
-        : "Choose images";
+        : "Choose images or a video";
       if (label) label.textContent = text;
       if (note) note.textContent = text;
     };
@@ -738,12 +738,17 @@
     return poll();
   }
 
+  function isVideoFile(file) {
+    return /\.(mp4|avi|mov|mkv|webm|mpeg|mpg|m4v|wmv|3gp)$/i.test(file.name || "");
+  }
+
   function uploadTaskImages(taskId, images) {
     var path = "/api/tasks/" + taskId + "/data";
     var batches = [];
     var current = [];
     var size = 0;
     var limit = 80 * 1024 * 1024;
+    var video = images.some(isVideoFile);
     images.forEach(function (file) {
       if (current.length && size + file.size > limit) {
         batches.push(current);
@@ -758,7 +763,7 @@
       var chain = Promise.resolve();
       batches.forEach(function (batch, batchIndex) {
         chain = chain.then(function () {
-          setStatus("ra-task-status", "Uploading images (" + (batchIndex + 1) + " of " + batches.length + ") into task " + taskId + "…");
+          setStatus("ra-task-status", "Uploading " + (video ? "video" : "images") + " (" + (batchIndex + 1) + " of " + batches.length + ") into task " + taskId + "…");
           var form = new FormData();
           form.append("image_quality", "70");
           batch.forEach(function (file, index) { form.append("client_files[" + index + "]", file, file.name); });
@@ -767,8 +772,13 @@
       });
       return chain;
     }).then(function () {
-      setStatus("ra-task-status", "CVAT is importing the images into task " + taskId + "…");
-      return cvatPost(path, { json: { image_quality: 70 }, headers: { "Upload-Finish": "true" } });
+      setStatus("ra-task-status", "CVAT is importing the " + (video ? "video" : "images") + " into task " + taskId + "…");
+      var finish = { image_quality: 70 };
+      if (video) {
+        finish.use_zip_chunks = true;
+        finish.use_cache = true;
+      }
+      return cvatPost(path, { json: finish, headers: { "Upload-Finish": "true" } });
     }).then(function (started) {
       if (!started.rq_id) throw new Error("CVAT did not start the image import.");
       return waitForImport(started.rq_id);
@@ -1046,7 +1056,7 @@
         setStatus("ra-task-status", note + " Annotating from the requirement. This can take several minutes.");
         return analyzer("/projects/" + view.projectId + "/annotate", {
           method: "POST",
-          json: { task_id: task.id, mode: "auto_first" },
+          json: { task_id: task.id, mode: "auto_first", shape: (document.getElementById("ra-shape") || {}).value || "auto" },
         });
       });
     }).then(function (done) {
@@ -1092,7 +1102,7 @@
       setStatus("ra-task-status", "Looking at " + task.size + " image(s). This can take several minutes. Correct the shapes in Standard when it finishes.");
       return analyzer("/projects/" + view.projectId + "/annotate", {
         method: "POST",
-        json: { task_id: view.taskId, mode: "auto_first" },
+        json: { task_id: view.taskId, mode: "auto_first", shape: (document.getElementById("ra-shape") || {}).value || "auto" },
       });
     }).then(function (result) {
       setStatus("ra-task-status", result.message || "Annotation finished.");
@@ -1476,7 +1486,21 @@
     if (!panel) return;
     var habits = (badgeData && badgeData.active_habits) || [];
     var waiting = (badgeData && badgeData.waiting) || [];
+    var counts = (badgeData && badgeData.corrections) || {};
+    var review = badgeData && badgeData.corrections
+      ? "<p class='ra-muted'>Generated " + (counts.generated || 0)
+        + " · corrected " + (counts.corrected || 0)
+        + " · accepted " + (counts.accepted || 0)
+        + " · rejected " + (counts.rejected || 0)
+        + " · added " + (counts.added || 0)
+        + " · pending " + (counts.pending || 0)
+        + ". Segmentation corrections " + (counts.segmentation_corrections || 0)
+        + ". Tracking corrections " + (counts.tracking_corrections || 0)
+        + ". " + escapeHtml(counts.training_status || "")
+        + " Model " + escapeHtml(counts.model_version || "") + ".</p>"
+      : "";
     panel.innerHTML = "<strong>" + text + "</strong><p class='ra-muted'>" + escapeHtml((badgeData && badgeData.mode_text) || "Learning stays inside this project.") + "</p>"
+      + review
       + (habits.length ? habits.map(function (item) { return "<p>" + escapeHtml(item) + "</p>"; }).join("") : "<p class='ra-muted'>No habit has enough examples yet. A habit needs 6 objects on 3 images. A correction needs 3 corrections on 2 images.</p>")
       + (waiting.length ? "<p class='ra-muted'>Not sure yet: " + escapeHtml(waiting.join(" ")) + "</p>" : "")
       + "<div class='ra-row'><button type='button' class='ra-btn' id='ra-badge-off'>" + (badgeData && badgeData.learn_enabled === false ? "Turn learning on" : "Turn learning off") + "</button><button type='button' class='ra-btn' id='ra-badge-forget'>Forget everything</button></div>";

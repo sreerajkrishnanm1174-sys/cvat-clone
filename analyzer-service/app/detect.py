@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 
-from .geometry import bbox, iou
+from .geometry import bbox, covers_same_object, iou
 
 log = logging.getLogger(__name__)
 
@@ -109,7 +109,12 @@ def dedupe_shapes(shapes: list[dict], minimum: float = 0.6) -> list[dict]:
     for shape in ordered:
         box = shape_box(shape)
         if any(
-            shape.get("label") == other.get("label") and iou(box, "rectangle", shape_box(other), "rectangle") >= minimum
+            shape.get("label") == other.get("label")
+            and (shape.get("type") or "rectangle") == (other.get("type") or "rectangle")
+            and (
+                iou(box, "rectangle", shape_box(other), "rectangle") >= minimum
+                or covers_same_object(box, shape_box(other))
+            )
             for other in kept
         ):
             continue

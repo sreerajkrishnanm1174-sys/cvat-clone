@@ -544,6 +544,236 @@ def test_spec_conflict_is_not_applied():
     assert kept["label"] == "car"
 
 
+def test_tracking_keeps_shape_and_id_across_a_gap():
+    from app.service import to_cvat_tracks
+
+    polygon = [0, 0, 30, 0, 40, 20, 28, 40, 8, 36, 0, 18]
+    moved = [8, 4, 38, 4, 48, 24, 36, 44, 16, 40, 8, 22]
+    linked = associate_by_iou(
+        {
+            0: [{"label": "person", "type": "polygon", "points": polygon, "score": 0.9}],
+            2: [{"label": "person", "type": "polygon", "points": moved, "score": 0.8}],
+            3: [
+                {"label": "person", "type": "polygon", "points": moved, "score": 0.8},
+                {"label": "sign", "type": "rectangle", "points": [0, 0, 10, 10], "score": 0.7},
+            ],
+        }
+    )
+    assert linked[0][0]["track_id"] == linked[2][0]["track_id"] == linked[3][0]["track_id"]
+    assert linked[3][1]["track_id"] != linked[3][0]["track_id"]
+    assert linked[3][0]["type"] == "polygon"
+    points = associate_by_iou(
+        {
+            0: [{"label": "joint", "type": "points", "points": [10, 10, 20, 12]}],
+            1: [{"label": "joint", "type": "points", "points": [12, 11, 22, 13]}],
+        }
+    )
+    assert points[0][0]["track_id"] == points[1][0]["track_id"]
+    labels = {"person": {"id": 4, "name": "person", "attributes": []}}
+    tracks = to_cvat_tracks({0: linked[0], 2: linked[2]}, labels)
+    assert tracks[0]["shapes"][0]["type"] == "polygon"
+    assert tracks[0]["shapes"][1]["outside"] is True
+    assert tracks[0]["shapes"][2]["type"] == "polygon"
+    mask = associate_by_iou(
+        {
+            0: [{"label": "human", "type": "mask", "encoded": "rle", "points": [0, 5, 1, 0, 4, 10, 20]}],
+            1: [{"label": "human", "type": "mask", "encoded": "rle", "points": [0, 6, 2, 0, 5, 11, 21]}],
+        }
+    )
+    assert mask[0][0]["track_id"] == mask[1][0]["track_id"]
+
+
+def test_one_object_keeps_one_track():
+    from app.detect import dedupe_shapes
+    from app.service import to_cvat_tracks
+
+    nested = dedupe_shapes([
+        {"label": "car", "type": "rectangle", "points": [0, 0, 100, 60], "score": 0.9},
+        {"label": "car", "type": "rectangle", "points": [12, 8, 70, 48], "score": 0.55},
+        {"label": "car", "type": "rectangle", "points": [220, 10, 300, 70], "score": 0.8},
+    ])
+    assert len(nested) == 2
+    linked = associate_by_iou(
+        {
+            0: [{"label": "car", "type": "rectangle", "points": [0, 0, 40, 40], "score": 0.9}],
+            1: [
+                {"label": "car", "type": "rectangle", "points": [10, 0, 50, 40], "score": 0.4},
+                {"label": "car", "type": "rectangle", "points": [0, 0, 40, 40], "score": 0.95},
+                {"label": "car", "type": "rectangle", "points": [4, 4, 36, 36], "score": 0.5},
+            ],
+            2: [{"label": "car", "type": "rectangle", "points": [2, 2, 42, 42], "score": 0.9}],
+        }
+    )
+    ids = {shape["track_id"] for frame in linked.values() for shape in frame}
+    assert ids == {linked[0][0]["track_id"]}
+    assert len(linked[1]) == 1
+    labels = {"car": {"id": 3, "name": "car", "attributes": []}}
+    tracks = to_cvat_tracks({0: linked[0]}, labels, end_frame=6)
+    assert tracks[0]["shapes"][-1]["outside"] is True
+    assert tracks[0]["shapes"][-1]["frame"] == 1
+    parked = to_cvat_tracks(
+        {0: [{"label": "car", "type": "rectangle", "points": [0, 0, 10, 10], "track_id": 1, "frame": 0}]},
+        labels,
+        end_frame=0,
+    )
+    assert parked[0]["shapes"][-1]["outside"] is False
+
+
+def test_object_that_leaves_the_frame_is_marked_outside():
+    from app.service import to_cvat_tracks
+
+    labels = {"car": {"id": 3, "name": "car", "attributes": []}}
+    tracks = to_cvat_tracks(
+        {
+            0: [
+                {"label": "car", "type": "rectangle", "points": [40, 20, 120, 80], "track_id": 1},
+                {"label": "car", "type": "rectangle", "points": [0, 20, 80, 80], "track_id": 2},
+            ],
+            1: [
+                {"label": "car", "type": "rectangle", "points": [150, 20, 199, 80], "track_id": 1},
+                {"label": "car", "type": "rectangle", "points": [0, 20, 80, 80], "track_id": 2},
+            ],
+            2: [
+                {"label": "car", "type": "rectangle", "points": [175, 30, 199, 55], "track_id": 1},
+                {"label": "car", "type": "rectangle", "points": [0, 20, 80, 80], "track_id": 2},
+            ],
+        },
+        labels,
+        end_frame=2,
+        frame_size=(200, 100),
+    )
+    leaving = next(track for track in tracks if any(shape["points"][0] == 40 for shape in track["shapes"]))
+    parked_track = next(track for track in tracks if track is not leaving)
+    assert [shape["outside"] for shape in leaving["shapes"]] == [False, False, True]
+    assert all(shape["outside"] is False for shape in parked_track["shapes"])
+    offscreen = to_cvat_tracks(
+        {0: [{"label": "car", "type": "rectangle", "points": [-40, 10, 12, 50], "track_id": 1}]},
+        labels,
+        end_frame=0,
+        frame_size=(200, 100),
+    )
+    assert offscreen[0]["shapes"][0]["outside"] is True
+
+
+def test_fast_motion_and_a_gap_keep_the_same_track():
+    from app.service import _min_assignment
+
+    pairs = _min_assignment([[4, 1, 3], [2, 0, 5], [3, 2, 2]])
+    assert sorted(pairs) == [(0, 1), (1, 0), (2, 2)]
+    moving = {
+        frame: [{"label": "car", "type": "rectangle", "points": [frame * 36, 10, frame * 36 + 40, 50], "score": 0.8}]
+        for frame in range(10)
+    }
+    linked = associate_by_iou(moving)
+    assert len({linked[frame][0]["track_id"] for frame in range(10)}) == 1
+    assert linked[9][0]["track_status"] == "updated"
+    hidden = {
+        frame: [{"label": "car", "type": "rectangle", "points": [frame * 20, 0, frame * 20 + 40, 30], "score": 0.9}]
+        for frame in (0, 1, 2, 3, 12)
+    }
+    recovered = associate_by_iou(hidden)
+    assert recovered[0][0]["track_id"] == recovered[12][0]["track_id"]
+    assert recovered[12][0]["track_status"] == "recovered"
+    lanes = {}
+    for frame in range(8):
+        lanes[frame] = [
+            {"label": "car", "type": "rectangle", "points": [frame * 30, 0, frame * 30 + 40, 24], "score": 0.9},
+            {"label": "car", "type": "rectangle", "points": [220 - frame * 30, 50, 260 - frame * 30, 74], "score": 0.88},
+        ]
+    crossed = associate_by_iou(lanes)
+    top = crossed[0][0]["track_id"]
+    bottom = crossed[0][1]["track_id"]
+    assert crossed[7][0]["track_id"] == top
+    assert crossed[7][1]["track_id"] == bottom
+    assert top != bottom
+
+
+def test_corrections_keep_the_track_and_reject_a_drifted_frame():
+    from app.learning import classify_frame, correction_summary
+    from app.service import carry_track_corrections, stabilize_tracks
+
+    snapshot = [{"label": "car", "type": "polygon", "points": [0, 0, 30, 0, 30, 20, 0, 20], "track_id": 7, "score": 0.8}]
+    corrected = [{"label": "car", "type": "polygon", "points": [80, 40, 120, 40, 120, 70, 80, 70], "track_id": 7, "source": "manual"}]
+    samples = classify_frame(snapshot, corrected)
+    assert samples[0]["role"] == "correction"
+    assert samples[0]["correction_type"] == "polygon_edit"
+    assert samples[0]["track_id"] == 7
+    assert samples[0]["boundary"] == "under"
+    assert samples[0]["model_version"] == "yolo-sam-rules"
+    summary = correction_summary([{"items": samples}], 3)
+    assert summary["corrected"] == 1
+    assert summary["segmentation_corrections"] == 1
+    assert "not replaced" in summary["training_status"]
+
+    annotations = {
+        "version": 1,
+        "tags": [],
+        "shapes": [],
+        "tracks": [{
+            "label_id": 4,
+            "frame": 0,
+            "source": "auto",
+            "shapes": [
+                {"type": "rectangle", "frame": 0, "points": [0, 0, 20, 10]},
+                {"type": "rectangle", "frame": 1, "points": [10, 0, 40, 10]},
+                {"type": "rectangle", "frame": 2, "points": [20, 0, 40, 10]},
+            ],
+        }],
+    }
+    snapshots = {
+        0: [{"label": "car", "type": "rectangle", "points": [0, 0, 20, 10], "track_id": 3}],
+        1: [{"label": "car", "type": "rectangle", "points": [0, 0, 20, 10], "track_id": 3}],
+        2: [{"label": "car", "type": "rectangle", "points": [20, 0, 40, 10], "track_id": 3}],
+    }
+    carried = carry_track_corrections(annotations, snapshots)
+    assert carried is not None
+    later = carried["tracks"][0]["shapes"][2]["points"]
+    assert later == [35, 0, 55, 10]
+
+    frames = {
+        0: [{"label": "car", "type": "rectangle", "points": [0, 0, 40, 20], "track_id": 1, "track_confidence": 0.9}],
+        1: [{"label": "car", "type": "rectangle", "points": [10, 0, 50, 20], "track_id": 1, "track_confidence": 0.9}],
+        2: [{"label": "car", "type": "rectangle", "points": [20, 0, 60, 20], "track_id": 1, "track_confidence": 0.9}],
+        3: [{"label": "car", "type": "rectangle", "points": [400, 0, 440, 20], "track_id": 1, "track_confidence": 0.2}],
+    }
+    stable = stabilize_tracks(frames, (640, 480))
+    assert stable[3][0]["outside"] is True
+    assert stable[2][0].get("outside") is not True
+    outside = stabilize_tracks(
+        {0: [{"label": "car", "type": "rectangle", "points": [-80, 0, -10, 20], "track_id": 1, "track_confidence": 0.9}]},
+        (200, 100),
+    )
+    assert outside[0][0]["outside"] is True
+
+
+def test_drifted_frame_is_redrawn_on_the_same_track():
+    from app.service import recover_drifted
+
+    frames = {
+        0: [{"label": "car", "type": "polygon", "points": [0, 0, 40, 0, 40, 20, 0, 20], "track_id": 1}],
+        1: [{
+            "label": "car",
+            "type": "polygon",
+            "points": [300, 0, 340, 0, 340, 20, 300, 20],
+            "track_id": 1,
+            "outside": True,
+            "review": "This frame drifted off the object, so it was not drawn. Check it.",
+            "track_confidence": 0.2,
+        }],
+    }
+
+    def trace(image, shapes):
+        assert image == b"frame"
+        assert shapes[0]["points"] == [0, 0, 40, 20]
+        return {0: [{"type": "polygon", "points": [4, 0, 44, 0, 44, 22, 4, 22], "label": "car"}]}
+
+    recover_drifted(frames, lambda frame: b"frame", trace)
+    assert frames[1][0]["outside"] is False
+    assert frames[1][0]["track_id"] == 1
+    assert frames[1][0]["points"][0] == 4
+    assert "review" not in frames[1][0]
+
+
 def test_review_flags_and_self_crossing_and_tracks():
     bowtie = [0, 0, 10, 10, 0, 10, 10, 0]
     assert crosses_self(bowtie)
@@ -1034,7 +1264,7 @@ def test_image_upload_waits_for_cvat_import(monkeypatch):
             self.kwargs = kwargs
 
         def request(self, method, path, **kwargs):
-            calls.append((method, path, kwargs.get("headers") or {}, kwargs.get("files")))
+            calls.append((method, path, kwargs.get("headers") or {}, kwargs.get("files"), kwargs.get("json")))
             if kwargs.get("headers", {}).get("Upload-Finish"):
                 return FakeResponse(202, {"rq_id": "import-1"})
             if path == "/api/requests/import-1":
@@ -1060,6 +1290,73 @@ def test_image_upload_waits_for_cvat_import(monkeypatch):
     assert uploaded[0][0] == "client_files[0]"
     assert uploaded[1][0] == "client_files[1]"
     assert any(item[1] == "/api/requests/import-1" for item in calls)
+    finish = next(item for item in calls if item[2].get("Upload-Finish"))
+    assert finish[4]["image_quality"] == 70
+    assert "use_zip_chunks" not in finish[4]
+
+
+def test_video_upload_asks_cvat_to_decode_frames(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, status, payload):
+            self.status_code = status
+            self.content = json.dumps(payload).encode()
+            self.text = self.content.decode()
+
+        def json(self):
+            return json.loads(self.content)
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def request(self, method, path, **kwargs):
+            calls.append((method, path, kwargs.get("headers") or {}, kwargs.get("files"), kwargs.get("json")))
+            if kwargs.get("headers", {}).get("Upload-Finish"):
+                return FakeResponse(202, {"rq_id": "import-2"})
+            if path == "/api/requests/import-2":
+                return FakeResponse(200, {"status": "finished", "message": ""})
+            if path == "/api/tasks/8":
+                return FakeResponse(200, {"id": 8, "size": 120, "mode": "interpolation"})
+            return FakeResponse(202, {})
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("app.cvat.httpx.Client", FakeClient)
+    from app.cvat import CvatClient
+
+    CvatClient("http://cvat", "token").upload_task_images(8, [("clip.mp4", b"video")])
+    finish = next(item for item in calls if item[2].get("Upload-Finish"))
+    assert finish[4]["use_zip_chunks"] is True
+    assert finish[4]["use_cache"] is True
+    uploaded = next(item[3] for item in calls if item[2].get("Upload-Multiple"))
+    assert uploaded[0][1][2] == "video/mp4"
+
+
+def test_chat_keeps_an_attached_video(tmp_path):
+    from app.chat import read_upload
+
+    bundle = read_upload([("street.mp4", b"video")], tmp_path)
+    assert bundle["images"] == [("street.mp4", b"video")]
+
+
+def test_chat_shows_the_model_error_and_skips_a_missing_model():
+    from app.chat import _anthropic_message, _model_unavailable
+
+    class Reply:
+        status_code = 400
+        text = '{"error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}'
+
+        def json(self):
+            return {"error": {"type": "invalid_request_error", "message": "Your credit balance is too low to access the Anthropic API."}}
+
+    message = _anthropic_message(Reply())
+    assert "credit balance" in message
+    assert not _model_unavailable(400, message)
+    assert _model_unavailable(400, "model: claude-sonnet-5-5 not found")
+    assert _model_unavailable(404, "")
 
 
 EXAMPLE = {

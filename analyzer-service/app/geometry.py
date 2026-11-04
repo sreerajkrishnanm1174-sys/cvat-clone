@@ -36,6 +36,34 @@ def box_size(points: list[float], shape_type: str) -> tuple[float, float]:
     return max(0.0, x2 - x1), max(0.0, y2 - y1)
 
 
+def covers_same_object(a_box: list[float], b_box: list[float]) -> bool:
+    """True when two boxes are the same object: a solid overlap, or one sitting inside the other."""
+    ax1, ay1, ax2, ay2 = a_box
+    bx1, by1, bx2, by2 = b_box
+    ax1, ax2 = min(ax1, ax2), max(ax1, ax2)
+    ay1, ay2 = min(ay1, ay2), max(ay1, ay2)
+    bx1, bx2 = min(bx1, bx2), max(bx1, bx2)
+    by1, by2 = min(by1, by2), max(by1, by2)
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter <= 0:
+        return False
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    if union and inter / union >= 0.6:
+        return True
+    smaller = min(area_a, area_b)
+    if not smaller or inter / smaller < 0.8:
+        return False
+    if area_a <= area_b:
+        cx, cy = (ax1 + ax2) / 2, (ay1 + ay2) / 2
+        return bx1 <= cx <= bx2 and by1 <= cy <= by2
+    cx, cy = (bx1 + bx2) / 2, (by1 + by2) / 2
+    return ax1 <= cx <= ax2 and ay1 <= cy <= ay2
+
+
 def iou(a_points: list[float], a_type: str, b_points: list[float], b_type: str) -> float:
     ax1, ay1, ax2, ay2 = bbox(a_points, a_type)
     bx1, by1, bx2, by2 = bbox(b_points, b_type)

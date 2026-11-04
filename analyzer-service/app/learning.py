@@ -73,37 +73,132 @@ def _compare_geometry(shape: dict) -> tuple[list, str]:
 
 
 def classify_frame(snapshot: list[dict], final: list[dict]) -> list[dict]:
-    """Split a finished frame into human, correction, untouched, or imported samples."""
+    """Split a finished frame into human, correction, untouched, or imported samples.
+
+    A shape with the same tracking id is the same object even when the annotator
+    moved it far enough that the boxes no longer overlap.
+    """
     used: set[int] = set()
     samples: list[dict] = []
     for pred in snapshot:
-        best = None
-        best_iou = 0.3
-        for index, shape in enumerate(final):
-            if index in used or shape.get("source") == "file":
-                continue
-            score = iou(*_compare_geometry(pred), *_compare_geometry(shape))
-            if score > best_iou:
-                best_iou = score
-                best = index
+        best = _match_correction(pred, final, used)
         if best is None:
-            samples.append({"role": "deleted", "agent": pred, "human": None})
+            samples.append(_sample("deleted", pred, None))
             continue
         used.add(best)
         human = final[best]
         role = "correction" if shape_changed(pred, human) else "untouched"
-        samples.append({"role": role, "agent": pred, "human": human, "iou": best_iou})
+        samples.append(_sample(role, pred, human))
     for index, shape in enumerate(final):
         if index in used:
             continue
         source = shape.get("source") or "manual"
         if source == "file":
-            samples.append({"role": "imported", "agent": None, "human": shape})
+            samples.append(_sample("imported", None, shape))
         elif source == "auto":
-            samples.append({"role": "untouched", "agent": shape, "human": shape})
+            samples.append(_sample("untouched", shape, shape))
         else:
-            samples.append({"role": "human", "agent": None, "human": shape})
+            samples.append(_sample("human", None, shape))
     return samples
+
+
+def _match_correction(pred: dict, final: list[dict], used: set[int]) -> int | None:
+    track_id = pred.get("track_id")
+    if track_id is not None:
+        for index, shape in enumerate(final):
+            if index in used or shape.get("source") == "file":
+                continue
+            if shape.get("track_id") == track_id and shape.get("label") == pred.get("label"):
+                return index
+    best = None
+    best_iou = 0.3
+    for index, shape in enumerate(final):
+        if index in used or shape.get("source") == "file":
+            continue
+        score = iou(*_compare_geometry(pred), *_compare_geometry(shape))
+        if score > best_iou:
+            best_iou = score
+            best = index
+    return best
+
+
+def _sample(role: str, agent: dict | None, human: dict | None) -> dict:
+    kind = "deleted" if role == "deleted" else "added" if role == "human" else _correction_kind(agent or {}, human or {})
+    if role == "untouched":
+        kind = "accepted"
+    reference = human or agent or {}
+    return {
+        "role": role,
+        "agent": agent,
+        "human": human,
+        "correction_type": kind,
+        "track_id": reference.get("track_id"),
+        "label": reference.get("label"),
+        "annotation_type": reference.get("type"),
+        "confidence": (agent or {}).get("score"),
+        "model_version": "yolo-sam-rules",
+        "corrected_at": datetime.now(timezone.utc).isoformat(),
+        "boundary": _boundary(agent, human),
+    }
+
+
+def _boundary(agent: dict | None, human: dict | None) -> str | None:
+    """Whether the corrected outline was larger or smaller than the prediction."""
+    if not agent or not human:
+        return None
+    if (human.get("type") or "") not in {"polygon", "mask"}:
+        return None
+    agent_points, agent_kind = _compare_geometry(agent)
+    human_points, human_kind = _compare_geometry(human)
+    agent_area = polygon_area(agent_points) if agent_kind == "polygon" else _box_area(agent_points)
+    human_area = polygon_area(human_points) if human_kind == "polygon" else _box_area(human_points)
+    if agent_area <= 0 or human_area <= 0:
+        return None
+    ratio = human_area / agent_area
+    if ratio > 1.15:
+        return "under"
+    if ratio < 0.85:
+        return "over"
+    return "aligned"
+
+
+def _box_area(points: list) -> float:
+    if len(points) < 4:
+        return 0.0
+    return abs(float(points[2]) - float(points[0])) * abs(float(points[3]) - float(points[1]))
+
+
+def _correction_kind(agent: dict, human: dict) -> str:
+    if not agent or not human:
+        return "edit"
+    if agent.get("label") != human.get("label"):
+        return "relabel"
+    if (agent.get("type") or "rectangle") != (human.get("type") or "rectangle"):
+        return "retype"
+    kind = human.get("type") or "rectangle"
+    if kind == "polygon":
+        if len(agent.get("points") or []) != len(human.get("points") or []):
+            return "polygon_points"
+        return "polygon_edit"
+    if kind == "mask":
+        return "mask_edit"
+    if kind in {"polyline", "points"}:
+        return "points_edit"
+    agent_box = _compare_geometry(agent)
+    human_box = _compare_geometry(human)
+    if not agent_box[0] or not human_box[0]:
+        return "edit"
+    aw, ah = box_size(*agent_box)
+    hw, hh = box_size(*human_box)
+    moved = abs(agent_box[0][0] - human_box[0][0]) > 2 or abs(agent_box[0][1] - human_box[0][1]) > 2
+    resized = abs(aw - hw) > 2 or abs(ah - hh) > 2
+    if resized:
+        return "resize"
+    if moved:
+        return "move"
+    if _attrs(agent) != _attrs(human):
+        return "attributes"
+    return "edit"
 
 
 def _images_objects(rows: list[dict]) -> tuple[int, int]:
@@ -428,6 +523,11 @@ def _correction_sentence(item: dict) -> str | None:
         return f"Add a {human.get('label')} when the annotator had to draw one that was missing."
     if role != "correction":
         return None
+    kind = item.get("correction_type")
+    if kind in {"polygon_edit", "polygon_points"} and human.get("label"):
+        return f"For {human.get('label')}, follow the corrected outline instead of the first polygon."
+    if kind == "mask_edit" and human.get("label"):
+        return f"For {human.get('label')}, keep the mask on the corrected object boundary."
     if agent.get("label") and human.get("label") and agent.get("label") != human.get("label"):
         return f"Do not label that object {agent.get('label')}. The annotator changed it to {human.get('label')}."
     moved = _moved_joints(agent.get("elements") or [], human.get("elements") or [])
@@ -468,6 +568,52 @@ def _moved_joints(agent: list[dict], human: list[dict]) -> list[str]:
         if _elements_changed([previous], [item]):
             moved.append(str(name))
     return moved
+
+
+def correction_summary(samples: list[dict], profile_version: int) -> dict:
+    """Counts for the learning panel. Image files are not stored with the corrections."""
+    generated = corrected = accepted = rejected = added = 0
+    segmentation = tracking = 0
+    pending = 0
+    for sample in samples:
+        for item in sample.get("items") or []:
+            role = item.get("role")
+            if role == "correction":
+                corrected += 1
+                generated += 1
+                pending += 1
+            elif role == "untouched":
+                accepted += 1
+                generated += 1
+            elif role == "deleted":
+                rejected += 1
+                generated += 1
+            elif role == "human":
+                added += 1
+            kind = item.get("correction_type")
+            if kind in {"polygon_edit", "polygon_points", "mask_edit"}:
+                segmentation += 1
+            if item.get("track_id") is not None and role == "correction":
+                tracking += 1
+    active = sum(1 for sample in samples if any(
+        item.get("role") == "correction" for item in (sample.get("items") or [])
+    ))
+    return {
+        "generated": generated,
+        "corrected": corrected,
+        "accepted": accepted,
+        "rejected": rejected,
+        "added": added,
+        "pending": pending,
+        "segmentation_corrections": segmentation,
+        "tracking_corrections": tracking,
+        "model_version": f"yolo-sam-rules-{profile_version}",
+        "training_status": (
+            "Corrections are kept as project rules and checked before they change later predictions. "
+            "YOLO and SAM weights are not replaced."
+        ),
+        "corrected_frames": active,
+    }
 
 
 def explain_profile(profile: dict | None, frame_count: int, mode: str) -> dict:

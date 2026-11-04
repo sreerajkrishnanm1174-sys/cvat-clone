@@ -19,7 +19,7 @@ from .config import Settings, get_settings
 from .cvat import CvatClient, CvatError
 
 from .db import ClientFormat, Prediction, Run, Sample, init_db, make_engine, make_session_factory
-from .learning import MODE_TEXT, explain_profile, explain_rule, prompt_lessons
+from .learning import MODE_TEXT, correction_summary, explain_profile, explain_rule, prompt_lessons
 from . import exporting, planning, report, service, spec
 from .vision import annotate_image
 from . import chat as agent_chat
@@ -46,6 +46,7 @@ class LearningSettingsIn(BaseModel):
 class AnnotateIn(BaseModel):
     task_id: int
     mode: str | None = None
+    shape: str | None = None
 
 
 class CustomExportIn(BaseModel):
@@ -348,6 +349,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         explained["running"] = 0
         explained["last_error"] = None
         explained["badge"] = "off" if not state.learn_enabled else "idle"
+        rows = session.scalars(select(Sample).where(Sample.cvat_project_id == project_id)).all()
+        explained["corrections"] = correction_summary(
+            [{"items": row.items_json} for row in rows],
+            state.profile_version,
+        )
         return explained
 
     @app.post("/projects/{project_id}/learning/settings")
@@ -432,7 +438,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session.add(run)
         session.flush()
         try:
-            summary = run_annotation(session, client, state, body.task_id, run, settings)
+            summary = run_annotation(session, client, state, body.task_id, run, settings, shape=body.shape or "auto")
         except CvatError as exc:
             run.status = "failed"
             run.message = "CVAT refused the annotation write"
@@ -488,7 +494,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=exc.status, detail="CVAT could not read that job") from exc
         if job.get("project_id") != project_id:
             raise HTTPException(status_code=404, detail="That job is not in this project")
-        learned = learn_job(session, client, state, job, settings, event_key="user-edit")
+        learned = learn_job(session, client, state, job, settings, event_key="user-edit", apply_forward=True)
         return {
             "samples": learned,
             "skipped": False,
@@ -772,7 +778,7 @@ def _with_guide(parsed: dict, text: str, settings: Settings) -> dict:
     return spec.apply_guide(parsed, guide)
 
 
-def run_annotation(session: Session, client: CvatClient, state, task_id: int, run: Run, settings: Settings, detect=None) -> dict:
+def run_annotation(session: Session, client: CvatClient, state, task_id: int, run: Run, settings: Settings, detect=None, shape: str = "auto") -> dict:
     task = client.get_task(task_id)
     if task.get("project_id") != state.cvat_project_id:
         raise HTTPException(status_code=404, detail="That task is not in this project")
@@ -812,11 +818,31 @@ def run_annotation(session: Session, client: CvatClient, state, task_id: int, ru
         run.status = "finished"
         run.message = "This project has no labels yet. Read the requirement and apply the labels first."
         return {"written": 0, "flagged": 0, "message": run.message}
+    requested = (shape or "auto").strip().lower()
+    if requested not in {"auto", "rectangle", "polygon", "mask", "polyline", "points", "ellipse", "skeleton", "cuboid"}:
+        run.status = "finished"
+        run.message = "That annotation shape is not supported."
+        return {"written": 0, "flagged": 0, "message": run.message}
+    if requested != "auto":
+        spec_labels = [item for item in spec_labels if item.get("type") == requested]
+        if not spec_labels:
+            run.status = "finished"
+            run.message = f"This project has no {requested} label, so that shape was not drawn."
+            return {"written": 0, "flagged": 0, "message": run.message}
     written = 0
     flagged = 0
     manual_frames: set[int] = set()
     run.total = sum(int(job.get("stop_frame", 0)) - int(job.get("start_frame", 0)) + 1 for job in jobs)
     video = task.get("mode") == "interpolation"
+    frame_size = (0, 0)
+    if video:
+        meta = client.get_task_meta(task_id)
+        for info in meta.get("frames") or []:
+            width = int(info.get("width") or 0)
+            height = int(info.get("height") or 0)
+            if width and height:
+                frame_size = (width, height)
+                break
     for job in jobs:
         if run.cancel_requested:
             run.status = "cancelled"
@@ -840,9 +866,37 @@ def run_annotation(session: Session, client: CvatClient, state, task_id: int, ru
             raw = _detect(client, settings, task_id, frame, spec_labels, detect, lessons)
             adapted = service.shapes_for_labels(raw, spec_labels, profile)
             per_frame[frame] = adapted
-        if video:
-            per_frame = service.associate_by_iou(per_frame)
+        if video and per_frame:
+            per_frame = service.associate_by_iou(
+                per_frame,
+                minimum=settings.track_match_minimum,
+                gap=settings.track_lost_frames,
+                gate=settings.track_gate,
+                high_confidence=settings.track_high_confidence,
+            )
+            per_frame = service.stabilize_tracks(per_frame, frame_size)
+            from .segment import trace_polygons
+
+            per_frame = service.recover_drifted(
+                per_frame,
+                lambda frame, task_id=task_id: client.get_frame(task_id, frame),
+                trace_polygons,
+            )
+        elif len(per_frame) > 1:
+            per_frame = service.associate_by_iou(
+                per_frame,
+                minimum=settings.track_match_minimum,
+                gap=settings.track_lost_frames,
+                gate=settings.track_gate,
+                high_confidence=settings.track_high_confidence,
+            )
         cvat_shapes = []
+        cvat_tracks = service.to_cvat_tracks(
+            per_frame,
+            {item["name"]: item for item in labels},
+            end_frame=stop,
+            frame_size=frame_size,
+        ) if video else []
         for frame, shapes in per_frame.items():
             session.add(
                 Prediction(
@@ -856,10 +910,11 @@ def run_annotation(session: Session, client: CvatClient, state, task_id: int, ru
                 )
             )
             for shape in shapes:
-                payload = service.to_cvat_shape(shape, {item["name"]: item for item in labels}, frame)
-                if payload:
-                    cvat_shapes.append(payload)
-                    written += 1
+                if not video:
+                    payload = service.to_cvat_shape(shape, {item["name"]: item for item in labels}, frame)
+                    if payload:
+                        cvat_shapes.append(payload)
+                        written += 1
                 reasons = service.review_reasons(
                     shape,
                     profile,
@@ -881,7 +936,14 @@ def run_annotation(session: Session, client: CvatClient, state, task_id: int, ru
             for shape in existing.get("shapes") or []
             if int(shape.get("frame") or 0) in manual_frames
         ]
-        if cvat_shapes or kept != (existing.get("shapes") or []):
+        if video:
+            written += sum(1 for track in cvat_tracks for item in track["shapes"] if not item.get("outside"))
+        manual_tracks = [
+            track
+            for track in existing.get("tracks") or []
+            if track.get("source") == "manual"
+        ]
+        if cvat_shapes or cvat_tracks or kept != (existing.get("shapes") or []):
             client.put_annotations(
                 "jobs",
                 job["id"],
@@ -889,7 +951,7 @@ def run_annotation(session: Session, client: CvatClient, state, task_id: int, ru
                     "version": existing.get("version") or 0,
                     "tags": existing.get("tags") or [],
                     "shapes": kept + cvat_shapes,
-                    "tracks": existing.get("tracks") or [],
+                    "tracks": (manual_tracks + cvat_tracks) if video else (existing.get("tracks") or []),
                 },
             )
     run.status = "finished"
@@ -1135,7 +1197,7 @@ def _export_shape(shape: dict, labels: dict[int, dict]) -> dict:
         }
 
 
-def learn_job(session: Session, client: CvatClient, state, job: dict, settings: Settings, event_key: str | None = None) -> int:
+def learn_job(session: Session, client: CvatClient, state, job: dict, settings: Settings, event_key: str | None = None, apply_forward: bool = False) -> int:
     if not state.learn_enabled:
         return 0
     labels = {item["id"]: item for item in client.get_labels(state.cvat_project_id)}
@@ -1158,6 +1220,14 @@ def learn_job(session: Session, client: CvatClient, state, job: dict, settings: 
             final=shapes,
         )
         count += 1
+    if apply_forward and frames:
+        snapshots = {
+            frame: service.latest_snapshot(session, state.cvat_project_id, job["id"], frame)
+            for frame in frames
+        }
+        updated = service.carry_track_corrections(annotations, snapshots)
+        if updated:
+            client.put_annotations("jobs", job["id"], updated)
     if not frames:
         service.record_frame(
             session,

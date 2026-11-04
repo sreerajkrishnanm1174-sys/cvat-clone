@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import httpx
 
@@ -60,7 +61,7 @@ class CvatClient:
         self._request("POST", path, headers={"Upload-Start": "true"})
         for batch in _file_batches(files):
             payload = [
-                (f"client_files[{index}]", (name, content, "application/octet-stream"))
+                (f"client_files[{index}]", (name, content, _content_type(name)))
                 for index, (name, content) in enumerate(batch)
             ]
             self._request(
@@ -74,7 +75,7 @@ class CvatClient:
         started = self._request(
             "POST",
             path,
-            json={"image_quality": 70},
+            json=_import_body(files),
             headers={"Upload-Finish": "true"},
             timeout=120,
         )
@@ -208,6 +209,29 @@ class CvatClient:
     def lambda_functions(self) -> list[dict]:
         data = self._request("GET", "/api/lambda/functions").json()
         return data if isinstance(data, list) else data.get("results", [])
+
+
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".mpeg", ".mpg", ".m4v", ".wmv", ".3gp"}
+
+
+def is_video_name(name: str) -> bool:
+    return Path(name).suffix.lower() in VIDEO_EXTENSIONS
+
+
+def _content_type(name: str) -> str:
+    if is_video_name(name):
+        return "video/mp4" if Path(name).suffix.lower() == ".mp4" else "application/octet-stream"
+    return "application/octet-stream"
+
+
+def _import_body(files: list[tuple[str, bytes]]) -> dict:
+    body = {"image_quality": 70}
+    if any(is_video_name(name) for name, _content in files):
+        # Match a manual CVAT video upload: decode frames into cached chunks.
+        # A raw video chunk is what the player fails to show.
+        body["use_zip_chunks"] = True
+        body["use_cache"] = True
+    return body
 
 
 def _file_batches(files: list[tuple[str, bytes]], limit: int = 80 * 1024 * 1024) -> list[list[tuple[str, bytes]]]:

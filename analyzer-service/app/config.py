@@ -19,6 +19,14 @@ class Settings(BaseSettings):
     annotation_refine: bool = True
     analyzer_root_path: str = ""
     analyzer_webhook_url: str = ""
+    # How close a detection must be to keep an existing track id.
+    track_match_minimum: float = 0.3
+    # Frames an unmatched track stays alive so a lost object can be re-identified.
+    track_lost_frames: int = 45
+    # Center-distance gate, as a multiple of the box diagonal.
+    track_gate: float = 2.0
+    # At or above this, the link is a normal update. Below it, the link is kept but flagged.
+    track_high_confidence: float = 0.55
 
 
 def get_settings() -> Settings:

@@ -10,7 +10,7 @@ import httpx
 
 from . import report, service, spec
 from .config import Settings
-from .cvat import CvatClient, CvatError
+from .cvat import CvatClient, CvatError, is_video_name
 from .db import Run
 from .service import get_project
 
@@ -456,11 +456,22 @@ def reply(settings: Settings, client: CvatClient, session, messages: list[dict],
             conversation.append({"role": role, "content": content})
     if not conversation or conversation[-1]["role"] != "user":
         raise RuntimeError("Send a message to the agent.")
+    folded = []
+    for message in conversation:
+        if folded and folded[-1]["role"] == message["role"]:
+            folded[-1]["content"] += "\n" + message["content"]
+        else:
+            folded.append(dict(message))
+    while folded and folded[0]["role"] != "user":
+        folded.pop(0)
+    conversation = folded
+    if not conversation:
+        raise RuntimeError("Send a message to the agent.")
     note = _upload_note(upload)
     if note:
         conversation[-1]["content"] += "\n" + note
     models = []
-    for name in (settings.anthropic_model, "claude-sonnet-5-5", "claude-sonnet-5"):
+    for name in (settings.anthropic_model, "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5"):
         if name and name not in models:
             models.append(name)
     last_error = "The agent did not respond."
@@ -498,6 +509,29 @@ def _upload_note(upload: dict) -> str:
     return " ".join(parts)
 
 
+def _anthropic_message(response) -> str:
+    text = ""
+    try:
+        body = response.json()
+        error = body.get("error") if isinstance(body, dict) else None
+        if isinstance(error, dict):
+            text = str(error.get("message") or "")
+    except Exception:
+        text = ""
+    if not text:
+        text = (response.text or "")[:300]
+    return " ".join(text.split())[:300]
+
+
+def _model_unavailable(status: int, message: str) -> bool:
+    if status == 404:
+        return True
+    lowered = message.lower()
+    return "model" in lowered and any(
+        phrase in lowered for phrase in ("not found", "does not exist", "not available", "invalid model")
+    )
+
+
 def _complete(api_key, model, conversation, client, session, settings, upload) -> tuple[str, str]:
     working = list(conversation)
     for _ in range(12):
@@ -517,10 +551,11 @@ def _complete(api_key, model, conversation, client, session, settings, upload) -
             },
             timeout=180,
         )
-        if response.status_code == 404:
-            return "", f"The model {model} is not available."
         if response.status_code >= 400:
-            return "", f"The agent returned HTTP {response.status_code}."
+            message = _anthropic_message(response)
+            if _model_unavailable(response.status_code, message):
+                return "", f"The model {model} is not available."
+            return "", message or f"The agent returned HTTP {response.status_code}."
         data = response.json()
         blocks = data.get("content") or []
         working.append({"role": "assistant", "content": blocks})
@@ -544,7 +579,7 @@ def read_upload(files: list[tuple[str, bytes]], data_dir: Path) -> dict:
     upload = {"images": [], "spec": None, "document_name": ""}
     for name, content in files:
         suffix = Path(name).suffix.lower()
-        if suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".zip"}:
+        if suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".zip"} or is_video_name(name):
             upload["images"].append((Path(name).name, content))
             continue
         target = data_dir / "chat" / Path(name).name

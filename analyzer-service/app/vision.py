@@ -13,7 +13,29 @@ FALLBACK_MODELS = (
     "claude-sonnet-5-5",
     "claude-sonnet-5",
     "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
 )
+
+
+def _vision_error_text(response) -> str:
+    text = ""
+    try:
+        body = response.json()
+        error = body.get("error") if isinstance(body, dict) else None
+        if isinstance(error, dict):
+            text = str(error.get("message") or "")
+    except Exception:
+        text = ""
+    if not text:
+        text = (response.text or "")[:300]
+    return " ".join(text.split())[:300]
+
+
+def _vision_model_missing(response) -> bool:
+    message = _vision_error_text(response).lower()
+    return "model" in message and any(
+        phrase in message for phrase in ("not found", "does not exist", "not available", "invalid model")
+    )
 
 
 class VisionError(RuntimeError):
@@ -227,7 +249,8 @@ def annotate_image(
             timeout=120,
         )
         if reply.status_code >= 400:
-            raise VisionError(f"The vision model returned HTTP {reply.status_code}.")
+            detail = _vision_error_text(reply)
+            raise VisionError(detail or f"The vision model returned HTTP {reply.status_code}.")
         return "".join(block.get("text") or "" for block in reply.json().get("content") or [] if block.get("type") == "text")
 
     traced = refine_shapes(image, shapes, labels, ask if api_key else None)
@@ -282,11 +305,12 @@ def _ask_vision(
             json={**body, "model": name},
             timeout=120,
         )
-        if response.status_code == 404:
+        if response.status_code == 404 or _vision_model_missing(response):
             last_error = f"The vision model {name} is not available."
             continue
         if response.status_code >= 400:
-            raise VisionError(f"The vision model returned HTTP {response.status_code}.")
+            detail = _vision_error_text(response)
+            raise VisionError(detail or f"The vision model returned HTTP {response.status_code}.")
         text = "".join(block.get("text") or "" for block in response.json().get("content") or [] if block.get("type") == "text")
         shapes = parse_shapes(text, labels, scale, width, height)
         if refine and _coarse_polygons(shapes):
@@ -308,7 +332,8 @@ def _ask_vision(
                     timeout=120,
                 )
                 if reply.status_code >= 400:
-                    raise VisionError(f"The vision model returned HTTP {reply.status_code}.")
+                    detail = _vision_error_text(reply)
+                    raise VisionError(detail or f"The vision model returned HTTP {reply.status_code}.")
                 return "".join(b.get("text") or "" for b in reply.json().get("content") or [] if b.get("type") == "text")
 
             shapes = refine_shapes(image, shapes, labels, ask)
