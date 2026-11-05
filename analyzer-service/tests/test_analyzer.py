@@ -412,6 +412,53 @@ def test_correction_changes_the_next_box_and_point_count():
     assert outline_is_template(circle)
 
 
+def test_incomplete_mask_is_completed_from_the_missing_region():
+    cv2 = pytest.importorskip("cv2")
+    numpy = pytest.importorskip("numpy")
+    from app.segment import _complete_mask, _missing_region_prompts, mask_quality
+
+    box = (20.0, 20.0, 120.0, 80.0)
+    partial = numpy.zeros((100, 160), numpy.uint8)
+    cv2.rectangle(partial, (20, 44), (120, 80), 1, -1)  # roof band (rows 20-43) is missing
+    first = mask_quality(partial, box, 160, 100)
+    assert first["ok"] is False
+    assert first["gaps"]["top"] > 0.3
+    prompts = _missing_region_prompts(first, box, partial, 160, 100)
+    assert prompts and prompts[0][2] == 1.0
+    assert 20 <= prompts[0][1] < 44
+
+    full = numpy.zeros((100, 160), numpy.uint8)
+    cv2.rectangle(full, (20, 20), (120, 80), 1, -1)
+    cv2.rectangle(full, (30, 20), (110, 24), 0, -1)
+    assert mask_quality(full, box, 160, 100)["ok"] is True
+
+    leaking = numpy.zeros((100, 160), numpy.uint8)
+    cv2.rectangle(leaking, (0, 0), (159, 99), 1, -1)
+    assert mask_quality(leaking, box, 160, 100)["ok"] is False
+
+    calls = []
+
+    class FakeSession:
+        pass
+
+    import app.segment as segment
+
+    original = segment._decode_full
+
+    def fake_decode(session, embedding, width, height, box_, extras=None, mask_input=None):
+        calls.append(list(extras or []))
+        return full.copy(), None
+
+    segment._decode_full = fake_decode
+    try:
+        result = _complete_mask(FakeSession(), None, 160, 100, box, [], partial, None, "car")
+    finally:
+        segment._decode_full = original
+    assert calls, "a refinement pass should run when the roof is missing"
+    assert mask_quality(result, box, 160, 100)["ok"] is True
+    assert int(result.sum()) > int(partial.sum())
+
+
 def test_mask_contour_follows_the_object_and_keeps_separate_parts():
     cv2 = pytest.importorskip("cv2")
     numpy = pytest.importorskip("numpy")
@@ -688,6 +735,89 @@ def test_fast_motion_and_a_gap_keep_the_same_track():
     assert top != bottom
 
 
+def test_parts_of_one_object_share_a_group():
+    from app.segment import _mark_parts
+    from app.service import associate_by_iou, to_cvat_tracks
+
+    body = [10, 10, 110, 10, 110, 80, 10, 80]
+    window = [30, 20, 70, 20, 70, 40, 30, 40]
+    copy = [12, 12, 108, 12, 108, 78, 12, 78]
+    marked = _mark_parts({"label": "car", "type": "polygon"}, [
+        {"label": "car", "type": "polygon", "points": body},
+        {"label": "car", "type": "polygon", "points": window},
+        {"label": "car", "type": "polygon", "points": copy},
+    ])
+    assert len(marked) == 2
+    assert marked[0]["primary"] is True
+    assert marked[1]["primary"] is False
+
+    def car(instance, points, primary, part):
+        return {
+            "label": "car", "type": "polygon", "points": points, "score": 0.9,
+            "instance": instance, "primary": primary, "part_index": part,
+        }
+
+    frames = {}
+    for frame in (0, 1):
+        shift = frame * 15
+        frames[frame] = [
+            car("a", [p + (shift if i % 2 == 0 else 0) for i, p in enumerate(body)], True, 0),
+            car("a", [p + (shift if i % 2 == 0 else 0) for i, p in enumerate(window)], False, 1),
+            car("b", [200 + (shift if i % 2 == 0 else 0) for i, p in enumerate(body)], True, 0),
+            {"label": "person", "type": "rectangle", "points": [0, 120, 24, 180], "score": 0.8},
+        ]
+    linked = associate_by_iou(frames)
+    def groups(frame, instance):
+        return {shape["group_id"] for shape in linked[frame] if shape.get("instance") == instance}
+
+    assert groups(0, "a") == groups(1, "a")
+    assert len(groups(0, "a")) == 1
+    assert groups(0, "a") != groups(0, "b")
+    person = next(shape for shape in linked[0] if shape["label"] == "person")
+    assert person["group_id"] not in groups(0, "a")
+    assert person["group_id"] not in groups(0, "b")
+    labels = {"car": {"id": 4, "name": "car", "type": "rectangle", "attributes": []}}
+    exported = []
+    for shape in linked[0]:
+        if shape.get("instance") != "a":
+            continue
+        exported.append({**shape, "type": "rectangle", "points": [10, 10, 40, 30]})
+    tracks = to_cvat_tracks({0: exported}, labels)
+    assert len(tracks) == 2
+    assert {track["group"] for track in tracks} == groups(0, "a")
+
+
+def test_a_track_keeps_its_label_when_one_frame_says_truck():
+    frames = {}
+    for frame in range(12):
+        label = "truck" if frame == 5 else "car"
+        frames[frame] = [{
+            "label": label,
+            "type": "rectangle",
+            "points": [frame * 8, 10, frame * 8 + 40, 30],
+            "score": 0.2 if frame == 5 else 0.86,
+        }]
+    linked = associate_by_iou(frames)
+    assert len({linked[frame][0]["track_id"] for frame in range(12)}) == 1
+    assert {linked[frame][0]["label"] for frame in range(12)} == {"car"}
+    crowded = {
+        0: [
+            {"label": "car", "type": "rectangle", "points": [0, 0, 80, 40], "score": 0.9},
+            {"label": "person", "type": "rectangle", "points": [20, 0, 40, 40], "score": 0.91},
+        ]
+    }
+    pair = associate_by_iou(crowded)
+    assert len(pair[0]) == 2
+    assert {shape["label"] for shape in pair[0]} == {"car", "person"}
+    jumped = {
+        0: [{"label": "car", "type": "rectangle", "points": [0, 0, 40, 20], "score": 0.9}],
+        1: [{"label": "car", "type": "rectangle", "points": [0, 0, 90, 50], "score": 0.2}],
+    }
+    drift = associate_by_iou(jumped)
+    assert drift[1][0]["track_id"] == drift[0][0]["track_id"]
+    assert drift[1][0]["outside"] is True
+
+
 def test_corrections_keep_the_track_and_reject_a_drifted_frame():
     from app.learning import classify_frame, correction_summary
     from app.service import carry_track_corrections, stabilize_tracks
@@ -856,9 +986,10 @@ class FakeCvat:
     def update_job(self, job_id, payload):
         self.job_updates.append(payload)
 
-    def create_issue(self, job_id, frame, message, position):
-        self.issues.append({"job": job_id, "frame": frame, "message": message, "position": position})
-        return {"id": len(self.issues)}
+    def clear_review_issues(self, job_id):
+        before = len(self.issues)
+        self.issues = [item for item in self.issues if item.get("job") != job_id or not str(item.get("message") or "").startswith("Review first:")]
+        return before - len(self.issues)
 
     def create_webhook(self, project_id, target_url, secret, events):
         self.webhooks.append(target_url)
@@ -922,6 +1053,35 @@ def test_api_apply_is_idempotent_and_permissions_fail(tmp_path):
         )
     )
     assert TestClient(bare).get("/projects/1/spec").status_code == 401
+
+
+def test_image_edits_are_learned_without_a_comment(tmp_path):
+    client, fake = _client(tmp_path)
+    headers = {"Authorization": "Bearer user"}
+    client.post("/projects/1/requirements", files={"file": ("req.txt", DOCUMENT.encode(), "text/plain")}, headers=headers)
+    client.post("/projects/1/labels/apply", json={"confirm_type_changes": False}, headers=headers)
+    client.post("/projects/1/learning/settings", json={"annotation_mode": "mixed", "learn_enabled": True}, headers=headers)
+    fake.jobs[0]["state"] = "annotation"
+    label_id = next(item["id"] for item in fake.labels if item["name"] == "car")
+    fake.annotations = {
+        "shapes": [{
+            "id": 11, "frame": 0, "label_id": label_id, "type": "rectangle",
+            "points": [1, 1, 20, 10], "source": "manual", "attributes": [],
+        }],
+        "tracks": [],
+        "tags": [],
+    }
+    assert client.post("/projects/1/sync", headers=headers).status_code == 200
+    fake.annotations["shapes"][0]["points"] = [21, 11, 40, 20]
+    assert client.post("/projects/1/sync", headers=headers).status_code == 200
+    from sqlalchemy import select
+    from app.db import Sample
+
+    session = client.app.state.sessions()
+    row = session.scalar(select(Sample).where(Sample.job_id == 3, Sample.frame == 0))
+    assert row is not None
+    assert any(item["role"] == "correction" and item["correction_type"] == "move" for item in row.items_json)
+    assert fake.issues == []
 
 
 def test_webhook_signature_duplicate_and_both_modes(tmp_path):
@@ -1531,6 +1691,25 @@ def test_saved_requirement_sets_json_folder_and_blocks_a_bad_shape(tmp_path):
     }])
     assert blocked is None
     assert blocked_report["errors"]
+
+
+def test_video_track_fills_the_frames_between_keyframes():
+    from app.main import _spread_track
+
+    track = {
+        "id": 9,
+        "label_id": 3,
+        "shapes": [
+            {"frame": 0, "type": "rectangle", "points": [0, 0, 10, 10], "outside": False},
+            {"frame": 2, "type": "rectangle", "points": [20, 0, 30, 10], "outside": False},
+            {"frame": 4, "type": "rectangle", "points": [20, 0, 30, 10], "outside": True},
+        ],
+    }
+    placed = dict(_spread_track(track, 0, 6))
+    assert set(placed) == {0, 1, 2, 3}
+    assert placed[1]["points"] == [10.0, 0.0, 20.0, 10.0]
+    assert placed[1]["track_id"] == 9
+    assert placed[3]["points"] == [20, 0, 30, 10]
 
 
 def test_requirement_on_the_project_is_used_for_export(tmp_path):

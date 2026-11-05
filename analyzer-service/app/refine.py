@@ -67,7 +67,10 @@ def refine_shapes(image: bytes, shapes: list[dict], labels: list[dict], ask: Ask
         try:
             if shape.get("type") in {"polygon", "mask"}:
                 if index in traced:
-                    out.extend(traced[index])
+                    for piece in traced[index]:
+                        marked = dict(piece)
+                        marked["instance"] = piece.get("instance") or f"sam-{index}"
+                        out.append(marked)
                     continue
                 points = shape.get("points") or []
                 # A detection box is not an outline. Leave it out instead of drawing the diagonal.

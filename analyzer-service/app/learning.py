@@ -72,6 +72,18 @@ def _compare_geometry(shape: dict) -> tuple[list, str]:
     return points, kind
 
 
+def shapes_from_items(items: list[dict]) -> list[dict]:
+    """The shapes last saved for an image, ignoring a written description of the edit."""
+    shapes = []
+    for item in items or []:
+        if item.get("role") == "deleted":
+            continue
+        shape = item.get("human") or item.get("agent")
+        if shape:
+            shapes.append(shape)
+    return shapes
+
+
 def classify_frame(snapshot: list[dict], final: list[dict]) -> list[dict]:
     """Split a finished frame into human, correction, untouched, or imported samples.
 
@@ -103,12 +115,15 @@ def classify_frame(snapshot: list[dict], final: list[dict]) -> list[dict]:
 
 
 def _match_correction(pred: dict, final: list[dict], used: set[int]) -> int | None:
+    identity = pred.get("id")
     track_id = pred.get("track_id")
-    if track_id is not None:
+    if identity is not None or track_id is not None:
         for index, shape in enumerate(final):
             if index in used or shape.get("source") == "file":
                 continue
-            if shape.get("track_id") == track_id and shape.get("label") == pred.get("label"):
+            same_shape = identity is not None and shape.get("id") == identity
+            same_track = track_id is not None and shape.get("track_id") == track_id
+            if (same_shape or same_track) and shape.get("label") == pred.get("label"):
                 return index
     best = None
     best_iou = 0.3

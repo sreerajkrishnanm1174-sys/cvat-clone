@@ -15,7 +15,7 @@ from functools import lru_cache
 
 import httpx
 
-from .geometry import bbox, crosses_self, flat, pairs
+from .geometry import bbox, crosses_self, flat, iou, pairs
 
 log = logging.getLogger(__name__)
 
@@ -96,7 +96,7 @@ def mask_to_polygons(mask, width: int, height: int, precision: str | None = None
         points = _simplify(contour, precision or polygon_precision(), width, height)
         if points and (crosses_self(points) or _artificial_diagonal(points)):
             points = None
-        if points and not _covers_mask(points, component):
+        if points and not _covers_mask(points, component, 0.9):
             points = _simplify(contour, "high", width, height)
         if (
             points
@@ -113,11 +113,12 @@ def _trace_one(session, embedding, width: int, height: int, shape: dict, neighbo
     if box is None:
         return []
     extras = _negative_prompts(box, neighbors or [])
-    mask = _decode_mask(session, embedding, width, height, box, extras)
+    mask, low_res = _decode_full(session, embedding, width, height, box, extras)
     if not _mask_is_body(mask):
         cx = (box[0] + box[2]) / 2
         cy = (box[1] + box[3]) / 2
-        mask = _decode_mask(session, embedding, width, height, box, [*extras, (cx, cy, 1.0)])
+        mask, low_res = _decode_full(session, embedding, width, height, box, [*extras, (cx, cy, 1.0)])
+    mask = _complete_mask(session, embedding, width, height, box, extras, mask, low_res, shape.get("label"))
     refined = _refine_mask(mask)
     if not _mask_is_body(refined):
         return []
@@ -126,7 +127,7 @@ def _trace_one(session, embedding, width: int, height: int, shape: dict, neighbo
     polygons = mask_to_polygons(refined, width, height)
     if not _mask_followed(refined, polygons):
         return []
-    return [{**shape, "type": "polygon", "points": points} for points in polygons]
+    return _mark_parts(shape, [{**shape, "type": "polygon", "points": points} for points in polygons])
 
 
 def _prompt_box(points: list[float], width: int, height: int) -> tuple[float, float, float, float] | None:
@@ -189,13 +190,19 @@ def _negative_prompts(box, neighbors: list) -> list[tuple[float, float, float]]:
     return prompts[:4]
 
 
-def _decode_mask(session, embedding, width: int, height: int, box, extras=None):
+def _decode_mask(session, embedding, width: int, height: int, box, extras=None, mask_input=None):
+    return _decode_full(session, embedding, width, height, box, extras, mask_input)[0]
+
+
+def _decode_full(session, embedding, width: int, height: int, box, extras=None, mask_input=None):
+    """Run the decoder once. Returns the placed mask and the low-resolution mask for a second pass."""
     np = _cv()[1]
     scale = 1024.0 / max(width, height)
     clicks = [(box[0], box[1], 2.0), (box[2], box[3], 3.0)]
     clicks.extend(extras or [])
     coords = np.array([[x * scale, y * scale] for x, y, _ in clicks], dtype=np.float32)[None, :, :]
     labels = np.array([[label for _, _, label in clicks]], dtype=np.float32)
+    has_mask = mask_input is not None and getattr(mask_input, "shape", None) == (1, 1, 256, 256)
     outputs = session.run(
         None,
         {
@@ -203,17 +210,166 @@ def _decode_mask(session, embedding, width: int, height: int, box, extras=None):
             "point_coords": coords,
             "point_labels": labels,
             "orig_im_size": np.array([height, width], dtype=np.float32),
-            "mask_input": np.zeros((1, 1, 256, 256), dtype=np.float32),
-            "has_mask_input": np.array([0], dtype=np.float32),
+            "mask_input": mask_input.astype(np.float32) if has_mask else np.zeros((1, 1, 256, 256), dtype=np.float32),
+            "has_mask_input": np.array([1 if has_mask else 0], dtype=np.float32),
         },
     )
     named = {output.name: value for output, value in zip(session.get_outputs(), outputs)}
     mask = np.squeeze(np.asarray(named.get("masks", outputs[0])))
+    low_res = named.get("low_res_masks")
+    if low_res is not None and getattr(low_res, "shape", None) != (1, 1, 256, 256):
+        low_res = None
     if mask.ndim != 2:
-        return None
+        return None, low_res
     xtl = int(np.asarray(named["xtl"]).reshape(-1)[0]) if "xtl" in named else 0
     ytl = int(np.asarray(named["ytl"]).reshape(-1)[0]) if "ytl" in named else 0
-    return _place_decoder_mask(mask, xtl, ytl, width, height)
+    return _place_decoder_mask(mask, xtl, ytl, width, height), low_res
+
+
+def mask_quality(mask, box, width: int, height: int) -> dict:
+    """How well a mask covers the detected object, without a single fixed area ratio."""
+    np = _cv()[1]
+    x1, y1, x2, y2 = [int(round(value)) for value in box]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(width - 1, x2), min(height - 1, y2)
+    result = {"ok": False, "gaps": {}, "outside": 1.0, "fill": 0.0, "parts": 0, "area": 0}
+    if mask is None:
+        return result
+    binary = np.asarray(mask) > 0
+    area = int(binary.sum())
+    if area == 0 or x2 <= x1 or y2 <= y1:
+        return result
+    inside = binary[y1 : y2 + 1, x1 : x2 + 1]
+    inside_area = int(inside.sum())
+    ys, xs = np.where(inside)
+    box_w = x2 - x1 + 1
+    box_h = y2 - y1 + 1
+    gaps = {
+        "top": int(ys.min()) / box_h,
+        "bottom": (box_h - 1 - int(ys.max())) / box_h,
+        "left": int(xs.min()) / box_w,
+        "right": (box_w - 1 - int(xs.max())) / box_w,
+    }
+    cv2 = _cv()[0]
+    count, _labels, stats, _ = cv2.connectedComponentsWithStats(inside.astype(np.uint8))
+    meaningful = sum(1 for index in range(1, count) if int(stats[index, cv2.CC_STAT_AREA]) >= 24)
+    # Column and row profile: a visible band of the object the mask skipped entirely.
+    cols = inside.any(axis=0)
+    rows = inside.any(axis=1)
+    missing_cols = _longest_false_run(cols) / box_w
+    missing_rows = _longest_false_run(rows) / box_h
+    result.update(
+        {
+            "gaps": {key: round(value, 3) for key, value in gaps.items()},
+            "outside": round((area - inside_area) / area, 3),
+            "fill": round(inside_area / (box_w * box_h), 3),
+            "parts": meaningful,
+            "area": area,
+            "hole_cols": round(missing_cols, 3),
+            "hole_rows": round(missing_rows, 3),
+        }
+    )
+    worst_gap = max(gaps.values())
+    result["ok"] = worst_gap <= 0.12 and result["outside"] <= 0.08 and missing_cols <= 0.2 and missing_rows <= 0.2
+    return result
+
+
+def _longest_false_run(values) -> int:
+    longest = current = 0
+    for value in values:
+        if value:
+            current = 0
+        else:
+            current += 1
+            longest = max(longest, current)
+    return longest
+
+
+def _quality_score(quality: dict) -> float:
+    if not quality.get("area"):
+        return -1.0
+    gaps = quality.get("gaps") or {}
+    worst_gap = max(gaps.values()) if gaps else 1.0
+    score = 1.0
+    score -= 2.0 * worst_gap
+    score -= 3.0 * float(quality.get("outside") or 0)
+    score -= 1.0 * max(float(quality.get("hole_cols") or 0), float(quality.get("hole_rows") or 0))
+    score -= 0.05 * max(0, int(quality.get("parts") or 1) - 2)
+    return score
+
+
+def _missing_region_prompts(quality: dict, box, mask, width: int, height: int) -> list[tuple[float, float, float]]:
+    """Positive points inside the box where the mask stopped short of the detection."""
+    np = _cv()[1]
+    x1, y1, x2, y2 = box
+    box_w = max(1.0, x2 - x1)
+    box_h = max(1.0, y2 - y1)
+    prompts = []
+    gaps = quality.get("gaps") or {}
+    binary = np.asarray(mask) > 0 if mask is not None else None
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+
+    def band(px, py):
+        px = min(max(px, 0.0), width - 1.0)
+        py = min(max(py, 0.0), height - 1.0)
+        if binary is not None and binary[int(py), int(px)]:
+            return
+        prompts.append((px, py, 1.0))
+
+    if gaps.get("top", 0) > 0.12:
+        band(cx, y1 + gaps["top"] * box_h * 0.5)
+    if gaps.get("bottom", 0) > 0.12:
+        band(cx, y2 - gaps["bottom"] * box_h * 0.5)
+    if gaps.get("left", 0) > 0.12:
+        band(x1 + gaps["left"] * box_w * 0.5, cy)
+    if gaps.get("right", 0) > 0.12:
+        band(x2 - gaps["right"] * box_w * 0.5, cy)
+    return prompts[:4]
+
+
+def _complete_mask(session, embedding, width, height, box, extras, mask, low_res, label=None):
+    """Fill visible parts of the object the first mask skipped. Keep the better candidate."""
+    first = mask_quality(mask, box, width, height)
+    log.info(
+        "segmentation label=%s stage=initial fill=%.2f outside=%.2f gaps=%s parts=%s",
+        label,
+        first.get("fill", 0),
+        first.get("outside", 0),
+        first.get("gaps"),
+        first.get("parts"),
+    )
+    if mask is None or first["ok"]:
+        return mask
+    best_mask, best_quality = mask, first
+    best_score = _quality_score(first)
+    prompts = _missing_region_prompts(first, box, mask, width, height)
+    candidates = []
+    if prompts:
+        candidates.append(([*extras, *prompts], low_res))
+        candidates.append(([*extras, *prompts], None))
+    for clicks, memory in candidates:
+        try:
+            candidate, _ = _decode_full(session, embedding, width, height, box, clicks, memory)
+        except Exception as exc:
+            log.warning("segmentation refinement skipped for %s: %s", label, exc)
+            continue
+        if not _mask_is_body(candidate):
+            continue
+        quality = mask_quality(candidate, box, width, height)
+        score = _quality_score(quality)
+        if score > best_score + 0.02:
+            best_mask, best_quality, best_score = candidate, quality, score
+    log.info(
+        "segmentation label=%s stage=final fill=%.2f outside=%.2f gaps=%s parts=%s refined=%s",
+        label,
+        best_quality.get("fill", 0),
+        best_quality.get("outside", 0),
+        best_quality.get("gaps"),
+        best_quality.get("parts"),
+        best_mask is not mask,
+    )
+    return best_mask
 
 
 def _place_decoder_mask(mask, xtl: int, ytl: int, width: int, height: int):
@@ -338,7 +494,42 @@ def _masks_from_binary(shape: dict, mask) -> list[dict]:
         if not rle:
             continue
         pieces.append({**shape, "type": "mask", "points": rle, "encoded": "rle"})
-    return pieces
+    return _mark_parts(shape, pieces)
+
+
+def _mark_parts(shape: dict, pieces: list[dict]) -> list[dict]:
+    """Keep separate parts of one detection and drop a second copy of the same region.
+
+    Parts share the detection. A later step gives them one CVAT group. Overlap
+    alone does not merge two detections; that only happens inside this mask.
+    """
+    ordered = sorted(pieces, key=lambda item: _part_area(item), reverse=True)
+    kept: list[dict] = []
+    for piece in ordered:
+        box = _part_box(piece)
+        if any(iou(box, "rectangle", _part_box(other), "rectangle") >= 0.85 for other in kept):
+            log.info("group label=%s status=duplicate-part", shape.get("label"))
+            continue
+        kept.append(piece)
+    for index, piece in enumerate(kept):
+        piece["part_index"] = index
+        piece["primary"] = index == 0
+    if len(kept) > 1:
+        log.info("group label=%s parts=%s status=created", shape.get("label"), len(kept))
+    return kept
+
+
+def _part_box(shape: dict) -> list[float]:
+    points = list(shape.get("points") or [])
+    if shape.get("type") == "mask" and len(points) >= 4:
+        points = points[-4:]
+    x1, y1, x2, y2 = bbox(points, "rectangle" if shape.get("type") == "mask" or len(points) < 6 else "polygon")
+    return [x1, y1, x2, y2]
+
+
+def _part_area(shape: dict) -> float:
+    box = _part_box(shape)
+    return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
 
 
 def _artificial_diagonal(points: list[float]) -> bool:
@@ -387,14 +578,14 @@ def _simplify(contour, precision: str, width: int, height: int) -> list[float] |
     return points
 
 
-def _covers_mask(points: list[float], mask) -> bool:
+def _covers_mask(points: list[float], mask, minimum: float = 0.82) -> bool:
     cv2, np = _cv()
     drawn = np.zeros_like(mask)
     ring = np.round(np.array(pairs(points), dtype=np.float32)).astype(np.int32)
     cv2.fillPoly(drawn, [ring], 1)
     union = int(((drawn == 1) | (mask == 1)).sum())
     overlap = int(((drawn == 1) & (mask == 1)).sum())
-    return union > 0 and overlap / union >= 0.82
+    return union > 0 and overlap / union >= minimum
 
 
 def _mask_followed(mask, polygons: list[list[float]]) -> bool:

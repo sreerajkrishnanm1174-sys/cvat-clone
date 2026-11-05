@@ -192,6 +192,9 @@
       "@keyframes ra-pulse{50%{opacity:.45}}",
       "#ra-learn-panel{position:fixed;top:56px;right:16px;z-index:10020;width:340px;max-width:92vw;background:#fff;border:1px solid #d6e4ff;border-radius:10px;padding:12px;box-shadow:0 8px 24px rgba(0,0,0,.12)}",
       ".ra-requirement-export{margin-top:12px;padding-top:12px;border-top:1px solid #f0f0f0}",
+      ".ra-requirement-export[hidden]{display:none}",
+      ".ant-select-dropdown .ra-client-format-option{cursor:pointer}",
+      ".ant-select-dropdown .ra-client-format-option.ant-select-item-option-active:not(.ant-select-item-option-disabled){background:rgba(0,0,0,.04)}",
     ].join("");
     document.head.appendChild(style);
   }
@@ -327,6 +330,35 @@
       node.textContent = text || "";
     }
     if (id === "ra-task-status") exportNote(text || "");
+  }
+
+  var annotateClock = null;
+
+  function formatTaken(ms) {
+    var total = Math.max(0, Math.floor(ms / 1000));
+    var minutes = Math.floor(total / 60);
+    var seconds = total % 60;
+    if (!minutes) return seconds + " sec";
+    return minutes + " min " + seconds + " sec";
+  }
+
+  function beginAnnotateClock(message) {
+    if (annotateClock) clearInterval(annotateClock);
+    var started = Date.now();
+    function paint() {
+      var node = document.getElementById("ra-task-status");
+      if (!node) return;
+      node.hidden = false;
+      node.textContent = message + " Time so far: " + formatTaken(Date.now() - started) + ".";
+    }
+    paint();
+    annotateClock = setInterval(paint, 1000);
+    return function (ending) {
+      var taken = formatTaken(Date.now() - started);
+      clearInterval(annotateClock);
+      annotateClock = null;
+      setStatus("ra-task-status", ending + " Time taken: " + taken + ".");
+    };
   }
 
   function setContext() {
@@ -1053,15 +1085,21 @@
           setStatus("ra-task-status", note + " Press Annotate this task when you want the agent to draw.");
           return null;
         }
-        setStatus("ra-task-status", note + " Annotating from the requirement. This can take several minutes.");
+        var finishClock = beginAnnotateClock(note + " Annotating from the requirement.");
         return analyzer("/projects/" + view.projectId + "/annotate", {
           method: "POST",
           json: { task_id: task.id, mode: "auto_first", shape: (document.getElementById("ra-shape") || {}).value || "auto" },
+        }).then(function (done) {
+          finishClock((done && done.message) || "Annotation finished. Correct the shapes in Standard, then learn from those corrections.");
+          return done;
+        }, function (error) {
+          finishClock(error.message || "Annotation failed.");
+          error.raTimed = true;
+          throw error;
         });
       });
     }).then(function (done) {
       if (!done) return null;
-      setStatus("ra-task-status", done.message || "Annotation finished. Correct the shapes in Standard, then learn from those corrections.");
       return refresh();
     }).catch(function (error) {
       if (createdId && !imported) {
@@ -1073,7 +1111,7 @@
           headers: { "X-CSRFToken": csrf() },
         }).then(refresh);
       }
-      setStatus("ra-task-status", error.message);
+      if (!error.raTimed) setStatus("ra-task-status", error.message);
       return null;
     }).then(function () { button.disabled = false; });
   }
@@ -1099,13 +1137,15 @@
     setStatus("ra-task-status", "Checking that the images are in the task…");
     cvat("/api/tasks/" + view.taskId).then(function (task) {
       if (!task.size) throw new Error("This task has no images. Choose the image files, create the task, and wait until the import finishes.");
-      setStatus("ra-task-status", "Looking at " + task.size + " image(s). This can take several minutes. Correct the shapes in Standard when it finishes.");
+      var finishClock = beginAnnotateClock("Looking at " + task.size + " image(s). Correct the shapes in Standard when it finishes.");
       return analyzer("/projects/" + view.projectId + "/annotate", {
         method: "POST",
         json: { task_id: view.taskId, mode: "auto_first", shape: (document.getElementById("ra-shape") || {}).value || "auto" },
+      }).then(function (result) {
+        finishClock((result && result.message) || "Annotation finished.");
+      }, function (error) {
+        finishClock(error.message || "Annotation failed.");
       });
-    }).then(function (result) {
-      setStatus("ra-task-status", result.message || "Annotation finished.");
     }).catch(function (error) {
       setStatus("ra-task-status", error.message);
     }).then(function () { button.disabled = false; });
@@ -1583,16 +1623,8 @@
     paintBadge();
     return cvat("/api/jobs/" + jobId).then(function (job) {
       if (!job.project_id) return null;
-      var previous = jobStates[job.id];
       jobStates[job.id] = job.state;
-      if (job.state === "completed") {
-        return analyzer("/projects/" + job.project_id + "/jobs/" + jobId + "/learn", { method: "POST" });
-      }
-      if (previous === "completed") {
-        return analyzer("/projects/" + job.project_id + "/jobs/" + jobId + "/unlearn", { method: "POST" });
-      }
-      badgeLocal = "";
-      return null;
+      return analyzer("/projects/" + job.project_id + "/jobs/" + jobId + "/learn", { method: "POST" });
     }).then(function (result) {
       if (result && result.samples != null && !result.skipped) {
         badgeLocal = "just";
@@ -1603,7 +1635,7 @@
       }
       var node = document.getElementById("ra-learning");
       if (node && result && result.samples != null) {
-        node.textContent = "Learned " + (result.samples || 0) + " frame(s) from your edits. " + (result.rules || 0) + " correction(s) will be used on the next task.";
+        node.textContent = "Learned " + (result.samples || 0) + " image(s) from the shapes you edited, including hand drawings and changes to the AI. " + (result.rules || 0) + " correction(s) will be used on the next task.";
       }
       return refreshBadge();
     }).catch(function (error) {
@@ -1618,6 +1650,35 @@
     syncJobLearning(jobId);
   }
 
+  var reviewJobsCleared = {};
+  function removeReviewIssues() {
+    var match = location.pathname.match(/\/jobs\/(\d+)/);
+    if (!match || reviewJobsCleared[match[1]]) return;
+    reviewJobsCleared[match[1]] = true;
+    cvat("/api/issues?job_id=" + match[1] + "&page_size=1000").then(function (data) {
+      var rows = (data && data.results) || [];
+      var pending = rows.filter(function (issue) {
+        return String(issue.message || "").indexOf("Review first:") === 0;
+      });
+      if (!pending.length) return null;
+      return Promise.all(pending.map(function (issue) {
+        return fetch(withOrg("/api/issues/" + issue.id), {
+          method: "DELETE",
+          credentials: "same-origin",
+          headers: { "X-CSRFToken": csrf() },
+        });
+      })).then(function () {
+        var key = "raClearedReviews:" + match[1];
+        if (!sessionStorage.getItem(key)) {
+          sessionStorage.setItem(key, "1");
+          location.reload();
+        }
+      });
+    }).catch(function () {
+      reviewJobsCleared[match[1]] = false;
+    });
+  }
+
   function insertRequirementExport() {
     var modal = document.querySelector(".cvat-modal-export-task, .cvat-modal-export-job, .cvat-modal-export-project");
     if (!modal || modal.querySelector(".ra-requirement-export")) return;
@@ -1625,16 +1686,8 @@
     if (!body) return;
     var box = document.createElement("div");
     box.className = "ra-requirement-export";
-    box.innerHTML = "<p class='ra-muted' id='ra-export-format'>Reads the requirement already on this project, follows its example and folder layout, checks the result, then downloads it.</p><button type='button' class='ra-btn primary'>Download client format</button>";
-    box.querySelector("button").onclick = function () {
-      var job = location.pathname.match(/\/jobs\/(\d+)/);
-      var task = location.pathname.match(/\/tasks\/(\d+)/);
-      var project = location.pathname.match(/\/projects\/(\d+)/);
-      if (job) downloadRequirementExport("jobs", Number(job[1]));
-      else if (task) downloadRequirementExport("tasks", Number(task[1]));
-      else if (project) downloadRequirementExport("projects", Number(project[1]));
-      else exportNote("Open the project, task, or job before exporting its requirement format.");
-    };
+    box.hidden = true;
+    box.innerHTML = "<p class='ra-muted' id='ra-export-format'>OK converts and downloads the client format. You can analyze another example below.</p>";
     body.appendChild(box);
     var custom = document.createElement("div");
     custom.className = "ra-custom-export";
@@ -1745,7 +1798,7 @@
       var projectId = kind === "projects" ? id : resource.project_id;
       if (!projectId) return null;
       var query = kind === "tasks" ? "?task_id=" + id : kind === "jobs" ? "?job_id=" + id : "";
-      exportNote("Preparing the format named in this project's requirement…");
+      exportNote("Converting this job to the client format…");
       return token().then(function (value) {
         return fetch("/analyzer/projects/" + projectId + "/export" + query, {
           headers: { Authorization: "Bearer " + value },
@@ -1791,9 +1844,92 @@
     });
   }
 
-  function finishExport(kind, id, rqId) {
-    var wait = rqId ? waitRequest(rqId) : Promise.resolve();
-    wait.then(function () { return downloadRequirementExport(kind, id); }).catch(function () {});
+  function exportModal() {
+    return document.querySelector(".cvat-modal-export-task, .cvat-modal-export-job, .cvat-modal-export-project");
+  }
+
+  function showClientLabel(modal) {
+    var item = modal.querySelector(".cvat-modal-export-select .ant-select-selection-item");
+    if (item && item.textContent.trim() !== "Client format") item.textContent = "Client format";
+  }
+
+  function startClientExport() {
+    var job = location.pathname.match(/\/jobs\/(\d+)/);
+    var task = location.pathname.match(/\/tasks\/(\d+)/);
+    var project = location.pathname.match(/\/projects\/(\d+)/);
+    if (job) downloadRequirementExport("jobs", Number(job[1]));
+    else if (task) downloadRequirementExport("tasks", Number(task[1]));
+    else if (project) downloadRequirementExport("projects", Number(project[1]));
+    else exportNote("Open the project, task, or job before exporting its client format.");
+  }
+
+  function bindExportChoice(modal) {
+    var ok = modal.querySelector(".ant-modal-footer .ant-btn-primary");
+    if (ok && !ok.dataset.raOk) {
+      ok.dataset.raOk = "1";
+      ok.addEventListener("click", function (event) {
+        if (modal.dataset.raFormat !== "client") return;
+        event.preventDefault();
+        event.stopPropagation();
+        startClientExport();
+      }, true);
+    }
+    var extra = modal.querySelector(".ra-requirement-export");
+    if (extra) extra.hidden = modal.dataset.raFormat !== "client";
+    if (modal.dataset.raFormat === "client") showClientLabel(modal);
+    var lists = document.querySelectorAll(".ant-select-dropdown:not(.ant-select-dropdown-hidden)");
+    Array.prototype.forEach.call(lists, function (dropdown) {
+      if (!dropdown.querySelector(".cvat-modal-export-option-item")) return;
+      var list = dropdown.querySelector(".rc-virtual-list-holder-inner, .ant-select-dropdown-menu");
+      if (!list || list.querySelector(".ra-client-format-option")) return;
+      var sample = list.querySelector(".cvat-modal-export-option-item");
+      var option = sample ? sample.cloneNode(true) : document.createElement("div");
+      option.className = "ant-select-item ant-select-item-option cvat-modal-export-option-item ra-client-format-option";
+      option.title = "Client format";
+      option.removeAttribute("aria-selected");
+      var content = option.querySelector(".ant-select-item-option-content");
+      if (!content) {
+        content = document.createElement("div");
+        content.className = "ant-select-item-option-content";
+        option.appendChild(content);
+      }
+      var label = content.querySelector("span:last-child");
+      if (label && label !== content) label.textContent = "Client format";
+      else content.textContent = "Client format";
+      option.addEventListener("mouseenter", function () {
+        Array.prototype.forEach.call(list.querySelectorAll(".ant-select-item-option-active"), function (item) {
+          item.classList.remove("ant-select-item-option-active");
+        });
+        option.classList.add("ant-select-item-option-active");
+      });
+      option.addEventListener("mouseleave", function () {
+        option.classList.remove("ant-select-item-option-active");
+      });
+      option.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        modal.dataset.raFormat = "client";
+        showClientLabel(modal);
+        if (extra) extra.hidden = false;
+        dropdown.classList.add("ant-select-dropdown-hidden");
+        var select = modal.querySelector(".cvat-modal-export-select");
+        if (select) select.classList.remove("ant-select-open");
+      });
+      list.appendChild(option);
+    });
+  }
+
+  if (!window.__raFormatChoice) {
+    window.__raFormatChoice = true;
+    document.addEventListener("click", function (event) {
+      var native = event.target.closest && event.target.closest(".cvat-modal-export-option-item");
+      if (!native || native.classList.contains("ra-client-format-option")) return;
+      var modal = exportModal();
+      if (!modal) return;
+      delete modal.dataset.raFormat;
+      var extra = modal.querySelector(".ra-requirement-export");
+      if (extra) extra.hidden = true;
+    }, true);
   }
 
   function watchAnnotationTraffic() {
@@ -1807,12 +1943,6 @@
       if (saved && (verb === "PUT" || verb === "PATCH")) scheduleLearn(saved[1]);
       var jobState = address.match(/\/api\/jobs\/(\d+)(?:\?|$)/);
       if (jobState && verb === "PATCH") scheduleLearn(jobState[1]);
-      var exported = address.match(/\/api\/(projects|tasks|jobs)\/(\d+)\/dataset\/export(?:\?|$)/);
-      if (exported && verb === "POST") {
-        var body = {};
-        try { body = JSON.parse(responseText || "{}"); } catch (error) { body = {}; }
-        finishExport(exported[1], Number(exported[2]), body.rq_id);
-      }
     }
     var nativeFetch = window.fetch;
     window.fetch = function (input, init) {
@@ -1858,6 +1988,9 @@
     insertProjectMenu();
     insertAiOption();
     insertRequirementExport();
+    removeReviewIssues();
+    var exportDialog = exportModal();
+    if (exportDialog) bindExportChoice(exportDialog);
     if (!window.__raBadgeAt || Date.now() - window.__raBadgeAt > 8000) {
       window.__raBadgeAt = Date.now();
       refreshBadge();

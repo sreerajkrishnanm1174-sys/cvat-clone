@@ -174,12 +174,22 @@ class CvatClient:
     def update_job(self, job_id: int, payload: dict) -> dict:
         return self._request("PATCH", f"/api/jobs/{job_id}", json=payload).json()
 
-    def create_issue(self, job_id: int, frame: int, message: str, position: list[float]) -> dict:
-        return self._request(
-            "POST",
-            "/api/issues",
-            json={"job": job_id, "frame": frame, "message": message, "position": position},
-        ).json()
+    def list_issues(self, job_id: int) -> list[dict]:
+        data = self._request("GET", "/api/issues", params={"job_id": job_id, "page_size": 1000}).json()
+        if isinstance(data, list):
+            return data
+        return data.get("results") or []
+
+    def delete_issue(self, issue_id: int) -> None:
+        self._request("DELETE", f"/api/issues/{issue_id}")
+
+    def clear_review_issues(self, job_id: int) -> int:
+        removed = 0
+        for issue in self.list_issues(job_id):
+            if str(issue.get("message") or "").startswith("Review first:"):
+                self.delete_issue(int(issue["id"]))
+                removed += 1
+        return removed
 
     def create_webhook(self, project_id: int, target_url: str, secret: str, events: list[str]) -> dict:
         return self._request(

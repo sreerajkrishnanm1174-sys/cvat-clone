@@ -326,7 +326,9 @@ def associate_by_iou(
     linked: dict[int, list[dict]] = {}
     next_track = 1
     for frame in sorted(frames):
-        shapes = _collapse_frame(list(frames[frame]))
+        incoming = list(frames[frame])
+        parts = [shape for shape in incoming if shape.get("primary") is False]
+        shapes = _collapse_frame([shape for shape in incoming if shape.get("primary") is not False])
         scores = [
             [_track_score(prior, shape, frame, gate) for prior in active]
             for shape in shapes
@@ -339,16 +341,33 @@ def associate_by_iou(
             if shape_index in assignment:
                 prior_index, score = assignment[shape_index]
                 prior = active[prior_index]
+                detected_label = item.get("label")
                 item["track_id"] = prior["track_id"]
+                item["label"] = prior.get("track_label") or prior.get("label")
+                item["track_label"] = item["label"]
                 item["weak_track"] = score < high_confidence
                 item["track_confidence"] = round(score, 3)
                 missed = frame - int(prior.get("frame") or frame)
                 item["track_status"] = "recovered" if missed > 1 else "updated"
+                if _geometry_unreliable(prior, shape, score):
+                    item["outside"] = True
+                    item["review"] = "This frame drifted off the object, so it was not drawn. Check it."
+                    item["points"] = list(prior.get("points") or item.get("points"))
+                    item["track_status"] = "drift"
                 if not item.get("attributes") and prior.get("attributes"):
                     item["attributes"] = dict(prior["attributes"])
                 _remember_track(item, prior, frame)
+                if detected_label and detected_label != item["label"]:
+                    log.info(
+                        "track frame=%s id=%s label=%s detection_label=%s confidence=%.3f status=label-kept",
+                        frame,
+                        item["track_id"],
+                        item["label"],
+                        detected_label,
+                        score,
+                    )
                 log.log(
-                    logging.INFO if item["track_status"] == "recovered" else logging.DEBUG,
+                    logging.INFO if item["track_status"] in {"recovered", "drift"} else logging.DEBUG,
                     "track frame=%s id=%s label=%s detection=%s confidence=%.3f status=%s",
                     frame,
                     item["track_id"],
@@ -368,6 +387,7 @@ def associate_by_iou(
             else:
                 item["track_id"] = next_track
                 next_track += 1
+                item["track_label"] = item.get("label")
                 item["weak_track"] = False
                 item["track_confidence"] = 1.0
                 item["track_status"] = "new"
@@ -379,26 +399,64 @@ def associate_by_iou(
                     item.get("label"),
                     item.get("score"),
                 )
+            item["group_id"] = int(item["track_id"])
             item["_seen"] = frame
             current.append(item)
-        seen = {item["track_id"] for item in current}
+        current.extend(_attach_parts(parts, current))
+        seen = {item["track_id"] for item in current if item.get("primary") is not False}
         active = [
             prior
             for prior in active
             if prior.get("track_id") not in seen and frame - int(prior.get("frame") or frame) <= gap
         ]
-        active.extend({**item, "frame": frame} for item in current)
+        active.extend({**item, "frame": frame} for item in current if item.get("primary") is not False)
         linked[frame] = current
     return linked
 
 
+def _attach_parts(parts: list[dict], primaries: list[dict]) -> list[dict]:
+    """Parts from one detection join that object's group. They do not become new objects."""
+    parents = {}
+    for item in primaries:
+        if item.get("instance"):
+            parents.setdefault(item["instance"], item)
+    attached = []
+    for part in parts:
+        parent = parents.get(part.get("instance"))
+        if parent is None:
+            log.info("group label=%s status=unmatched-part", part.get("label"))
+            continue
+        parent_id = int(parent["track_id"])
+        sibling = dict(part)
+        sibling["label"] = parent.get("label")
+        sibling["track_label"] = parent.get("label")
+        sibling["group_id"] = parent_id
+        sibling["track_id"] = parent_id * 1000 + int(part.get("part_index") or 1)
+        sibling["track_status"] = parent.get("track_status")
+        sibling["source"] = parent.get("source") or sibling.get("source")
+        if parent.get("attributes") and not sibling.get("attributes"):
+            sibling["attributes"] = dict(parent["attributes"])
+        log.info(
+            "group id=%s track=%s label=%s part=%s status=assigned",
+            parent_id,
+            sibling["track_id"],
+            sibling.get("label"),
+            sibling.get("part_index"),
+        )
+        attached.append(sibling)
+    return attached
+
+
 def _remember_track(item: dict, prior: dict | None, frame: int) -> None:
-    box = _shape_box(item)
+    source = prior if item.get("outside") and prior else item
+    box = _shape_box(source)
     history = list((prior or {}).get("_history") or [])
     history.append((frame, box))
     item["_history"] = history[-8:]
     item["_box"] = box
     item["_velocity"] = _velocity(item["_history"])
+    item["_kalman"] = _kalman_update(prior, box, frame)
+    item["track_label"] = item.get("track_label") or (prior or {}).get("track_label") or item.get("label")
 
 
 def _velocity(history: list[tuple[int, list[float]]]) -> tuple[float, float]:
@@ -417,11 +475,66 @@ def _center(box: list[float]) -> tuple[float, float]:
 
 
 def _predict_box(prior: dict, frame: int) -> list[float]:
+    """Constant-velocity prediction. The saved shape still comes from the detection."""
     box = list(prior.get("_box") or _shape_box(prior))
     last = int(prior.get("frame") or frame)
     step = min(8, max(0, frame - last))
-    vx, vy = prior.get("_velocity") or (0.0, 0.0)
-    return [box[0] + vx * step, box[1] + vy * step, box[2] + vx * step, box[3] + vy * step]
+    state = prior.get("_kalman")
+    if state:
+        cx, cy, vx, vy = state
+    else:
+        vx, vy = prior.get("_velocity") or (0.0, 0.0)
+        cx, cy = _center(box)
+    width = box[2] - box[0]
+    height = box[3] - box[1]
+    px = cx + vx * step
+    py = cy + vy * step
+    return [px - width / 2, py - height / 2, px + width / 2, py + height / 2]
+
+
+def _kalman_update(prior: dict | None, box: list[float], frame: int) -> tuple[float, float, float, float]:
+    cx, cy = _center(box)
+    previous = (prior or {}).get("_kalman")
+    if not previous or prior is None:
+        vx, vy = _velocity((prior or {}).get("_history") or [])
+        return (cx, cy, vx, vy)
+    px, py, pvx, pvy = previous
+    step = max(1, frame - int(prior.get("frame") or frame))
+    vx = (0.6 * pvx) + (0.4 * (cx - px) / step)
+    vy = (0.6 * pvy) + (0.4 * (cy - py) / step)
+    return (cx, cy, vx, vy)
+
+
+def _class_relation(left: str | None, right: str | None) -> str:
+    """same, related (car/truck), or different. A different class is not the same object."""
+    first = (left or "").strip().lower()
+    second = (right or "").strip().lower()
+    if not first or not second or first == second:
+        return "same"
+    from .detect import _group
+
+    left_group = _group(first)
+    right_group = _group(second)
+    if left_group and right_group and left_group == right_group:
+        return "same"
+    vehicles = {"car", "truck", "bus", "vehicle", "van", "lorry"}
+    if first in vehicles and second in vehicles:
+        return "related"
+    return "different"
+
+
+def _geometry_unreliable(prior: dict, shape: dict, score: float) -> bool:
+    """A low-confidence box that changes size sharply is not written onto the track."""
+    current = _box_area(_shape_box(shape))
+    if current <= 1:
+        return True
+    previous = _box_area(_shape_box(prior))
+    if previous <= 1:
+        return False
+    ratio = current / previous
+    if 0.35 <= ratio <= 2.5:
+        return False
+    return float(shape.get("score") or 0) < 0.5 or score < 0.55
 
 
 def _assign_tracks(scores: list[list[float]], minimum: float) -> list[tuple[int, int, float]]:
@@ -490,7 +603,9 @@ def _min_assignment(cost: list[list[float]]) -> list[tuple[int, int]]:
 
 def _center_inside(shape: dict, other: dict) -> bool:
     """A second outline of an object already tracked on this frame."""
-    if shape.get("label") != other.get("label") or (shape.get("type") or "rectangle") != (other.get("type") or "rectangle"):
+    if _class_relation(shape.get("label"), other.get("label")) == "different":
+        return False
+    if (shape.get("type") or "rectangle") != (other.get("type") or "rectangle"):
         return False
     box = _shape_box(shape)
     cx, cy = _center(box)
@@ -509,7 +624,9 @@ def _collapse_frame(shapes: list[dict]) -> list[dict]:
 
 
 def _same_object(shape: dict, other: dict) -> bool:
-    if shape.get("label") != other.get("label") or (shape.get("type") or "rectangle") != (other.get("type") or "rectangle"):
+    if _class_relation(shape.get("label"), other.get("label")) == "different":
+        return False
+    if (shape.get("type") or "rectangle") != (other.get("type") or "rectangle"):
         return False
     return covers_same_object(_shape_box(shape), _shape_box(other))
 
@@ -521,7 +638,8 @@ def _shape_box(shape: dict) -> list[float]:
 
 
 def _track_score(prior: dict, shape: dict, frame: int = 0, gate: float = 2.0) -> float:
-    if prior.get("label") != shape.get("label") or (prior.get("type") or "rectangle") != (shape.get("type") or "rectangle"):
+    relation = _class_relation(prior.get("track_label") or prior.get("label"), shape.get("label"))
+    if relation == "different" or (prior.get("type") or "rectangle") != (shape.get("type") or "rectangle"):
         return 0.0
     if frame - int(prior.get("frame") or frame) < 0:
         return 0.0
@@ -530,10 +648,14 @@ def _track_score(prior: dict, shape: dict, frame: int = 0, gate: float = 2.0) ->
     predicted = _predict_box(prior, frame)
     current = _shape_box(shape)
     if kind == "points":
-        return max(_points_score(prior, shape), _points_score(_shifted_prior(prior, frame), shape))
-    if kind == "polyline":
-        return max(_polyline_score(prior, shape), _polyline_score(_shifted_prior(prior, frame), shape))
-    return max(_box_affinity(last_box, current, gate), _box_affinity(predicted, current, gate))
+        score = max(_points_score(prior, shape), _points_score(_shifted_prior(prior, frame), shape))
+    elif kind == "polyline":
+        score = max(_polyline_score(prior, shape), _polyline_score(_shifted_prior(prior, frame), shape))
+    else:
+        score = max(_box_affinity(last_box, current, gate), _box_affinity(predicted, current, gate))
+    if relation == "related" and score < 0.45:
+        return 0.0
+    return score * (0.9 if relation == "related" else 1.0)
 
 
 def _shifted_prior(prior: dict, frame: int) -> dict:
@@ -866,11 +988,13 @@ def to_cvat_tracks(
             hidden["occluded"] = True
             keyed.append(_track_shape(hidden))
         first = shapes[0]
+        for shape in keyed:
+            shape["label_id"] = first["label_id"]
         tracks.append(
             {
                 "label_id": first["label_id"],
                 "frame": int(first["frame"]),
-                "group": 0,
+                "group": int(first.get("group") or 0),
                 "source": "auto",
                 "shapes": keyed,
                 "attributes": first.get("attributes") or [],
@@ -1057,7 +1181,7 @@ def to_cvat_shape(shape: dict, label_ids: dict[str, dict], frame: int) -> dict |
         "rotation": 0,
         "source": "auto",
         "attributes": attributes,
-        "group": shape.get("track_id") or 0,
+        "group": int(shape.get("group_id") or 0),
     }
     if shape["type"] not in {"rectangle", "ellipse"}:
         payload.pop("rotation", None)
@@ -1145,7 +1269,10 @@ def _from_cvat(shape: dict, label: dict, labels_by_id: dict | None = None) -> di
         "attributes": attributes,
         "source": shape.get("source") or "manual",
         "score": shape.get("score"),
+        "group_id": int(shape.get("group") or 0),
     }
+    if shape.get("id") is not None:
+        result["id"] = shape.get("id")
     if elements:
         result["elements"] = elements
     return result

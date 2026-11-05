@@ -19,7 +19,7 @@ from .config import Settings, get_settings
 from .cvat import CvatClient, CvatError
 
 from .db import ClientFormat, Prediction, Run, Sample, init_db, make_engine, make_session_factory
-from .learning import MODE_TEXT, correction_summary, explain_profile, explain_rule, prompt_lessons
+from .learning import MODE_TEXT, correction_summary, explain_profile, explain_rule, prompt_lessons, shapes_from_items
 from . import exporting, planning, report, service, spec
 from .vision import annotate_image
 from . import chat as agent_chat
@@ -849,6 +849,10 @@ def run_annotation(session: Session, client: CvatClient, state, task_id: int, ru
             return {"written": written, "flagged": flagged}
         start = int(job.get("start_frame") or 0)
         stop = int(job.get("stop_frame") or start)
+        try:
+            client.clear_review_issues(int(job["id"]))
+        except CvatError:
+            pass
         existing = client.get_annotations("jobs", job["id"])
         manual_frames = {
             int(shape.get("frame") or 0)
@@ -915,22 +919,6 @@ def run_annotation(session: Session, client: CvatClient, state, task_id: int, ru
                     if payload:
                         cvat_shapes.append(payload)
                         written += 1
-                reasons = service.review_reasons(
-                    shape,
-                    profile,
-                    next((item for item in (state.spec_json or {}).get("labels") or [] if item["name"] == shape["label"]), None),
-                    weak_track=bool(shape.get("weak_track")),
-                )
-                if reasons:
-                    points = shape.get("points") or [0, 0]
-                    position = [float(points[0]), float(points[1])]
-                    client.create_issue(
-                        job["id"],
-                        frame,
-                        "Review first: " + "; ".join(reasons),
-                        position,
-                    )
-                    flagged += 1
         kept = [
             shape
             for shape in existing.get("shapes") or []
@@ -965,7 +953,7 @@ def run_annotation(session: Session, client: CvatClient, state, task_id: int, ru
             else " No saved corrections were found yet, so this pass follows the requirement."
         )
         run.message = (
-            f"Added {written} shapes and flagged {flagged} for review.{learned} "
+            f"Added {written} shapes.{learned} "
             "Save your edits in this project and the next task follows them. "
             "Frames you already edited were left as you drew them."
         )
@@ -1025,6 +1013,45 @@ def _detect(client, settings: Settings, task_id: int, frame: int, labels: list[d
     return raw
 
 
+def _spread_track(track: dict, start: int, stop: int) -> list[tuple[int, dict]]:
+    """Repeat a CVAT track on every frame it stays visible, including frames between keyframes."""
+    keyframes = sorted(
+        (shape for shape in track.get("shapes") or [] if shape.get("frame") is not None),
+        key=lambda item: int(item["frame"]),
+    )
+    placed = []
+    for index, shape in enumerate(keyframes):
+        if shape.get("outside"):
+            continue
+        frame = int(shape["frame"])
+        nxt = keyframes[index + 1] if index + 1 < len(keyframes) else None
+        last = int(nxt["frame"]) if nxt is not None else stop + 1
+        for current in range(max(frame, start), min(max(last, frame + 1), stop + 1)):
+            placed.append((current, _shape_at(shape, nxt, current, track)))
+    return placed
+
+
+def _shape_at(shape: dict, nxt: dict | None, frame: int, track: dict) -> dict:
+    copy = dict(shape)
+    copy["label_id"] = track.get("label_id")
+    copy["track_id"] = track.get("id")
+    copy["frame"] = frame
+    if nxt is None or nxt.get("outside") or int(nxt.get("frame") or frame) <= frame:
+        return copy
+    if (shape.get("type") or "") == "mask" or (nxt.get("type") or "") == "mask":
+        return copy
+    left = [float(value) for value in shape.get("points") or []]
+    right = [float(value) for value in nxt.get("points") or []]
+    if len(left) != len(right) or len(left) < 2:
+        return copy
+    span = int(nxt["frame"]) - int(shape["frame"])
+    if span <= 0:
+        return copy
+    weight = (frame - int(shape["frame"])) / span
+    copy["points"] = [round(left[index] + (right[index] - left[index]) * weight, 2) for index in range(len(left))]
+    return copy
+
+
 def _client_images(client: CvatClient, project_id: int, task_id: int | None, job_id: int | None) -> list[dict]:
     labels = {int(item["id"]): item for item in client.get_labels(project_id) if item.get("id") is not None}
     if job_id:
@@ -1051,17 +1078,13 @@ def _client_images(client: CvatClient, project_id: int, task_id: int | None, job
         frames = meta_cache[task_key].get("frames") or []
         grouped: dict[int, list[dict]] = {}
         annotations = client.get_annotations("jobs", int(job["id"]))
+        start = int(job.get("start_frame") or 0)
+        stop = int(job.get("stop_frame") or start)
         for shape in annotations.get("shapes") or []:
             grouped.setdefault(int(shape.get("frame") or 0), []).append(shape)
         for track in annotations.get("tracks") or []:
-            for shape in track.get("shapes") or []:
-                if shape.get("outside"):
-                    continue
-                copy = dict(shape)
-                copy["label_id"] = track.get("label_id")
-                grouped.setdefault(int(shape.get("frame") or 0), []).append(copy)
-        start = int(job.get("start_frame") or 0)
-        stop = int(job.get("stop_frame") or start)
+            for frame, shape in _spread_track(track, start, stop):
+                grouped.setdefault(frame, []).append(shape)
         for frame in range(start, stop + 1):
             info = frames[frame] if 0 <= frame < len(frames) else {}
             name = str(info.get("name") or f"task_{task_key}_frame_{frame}.jpg")
@@ -1204,20 +1227,39 @@ def learn_job(session: Session, client: CvatClient, state, job: dict, settings: 
     annotations = client.get_annotations("jobs", job["id"])
     frames = service.group_frames(annotations, labels)
     event_key = event_key or str(job.get("updated_date") or job.get("id"))
+    job_id = int(job["id"])
+    previous = {
+        int(row.frame): shapes_from_items(row.items_json)
+        for row in session.scalars(
+            select(Sample).where(
+                Sample.cvat_project_id == state.cvat_project_id,
+                Sample.job_id == job_id,
+                Sample.event_key == event_key,
+            )
+        ).all()
+    }
+    predicted: dict[int, list] = {}
+    for row in session.scalars(
+        select(Prediction)
+        .where(Prediction.cvat_project_id == state.cvat_project_id, Prediction.job_id == job_id)
+        .order_by(Prediction.id.desc())
+    ).all():
+        predicted.setdefault(int(row.frame), list(row.shapes_json or []))
+    frame_ids = set(frames) | set(previous) | set(predicted)
     count = 0
-    for frame, shapes in frames.items():
-        snapshot = service.latest_snapshot(session, state.cvat_project_id, job["id"], frame)
+    for frame in sorted(frame_ids):
+        snapshot = predicted.get(frame) or previous.get(frame) or []
         if state.compare_with_agent and not snapshot:
             snapshot = _quiet_comparison(client, settings, int(job.get("task_id") or 0), int(frame), list(labels.values()))
         service.record_frame(
             session,
             state,
             task_id=int(job.get("task_id") or 0),
-            job_id=int(job["id"]),
+            job_id=job_id,
             frame=int(frame),
             event_key=event_key,
             snapshot=snapshot,
-            final=shapes,
+            final=frames.get(frame, []),
         )
         count += 1
     if apply_forward and frames:
@@ -1228,17 +1270,18 @@ def learn_job(session: Session, client: CvatClient, state, job: dict, settings: 
         updated = service.carry_track_corrections(annotations, snapshots)
         if updated:
             client.put_annotations("jobs", job["id"], updated)
-    if not frames:
+    if count == 0:
         service.record_frame(
             session,
             state,
             task_id=int(job.get("task_id") or 0),
-            job_id=int(job["id"]),
+            job_id=job_id,
             frame=int(job.get("start_frame") or 0),
             event_key=event_key,
             snapshot=[],
             final=[],
         )
+        count = 1
     return count
 
 
