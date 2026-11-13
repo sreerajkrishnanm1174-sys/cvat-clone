@@ -51,7 +51,7 @@ TOOLS = [
     },
     {
         "name": "apply_requirement",
-        "description": "Save the requirement document attached to this message onto a project and create its labels.",
+        "description": "Read the attached requirement document, create or update its CVAT project labels and every specified label attribute, then read the CVAT configuration back to verify it.",
         "input_schema": {
             "type": "object",
             "properties": {"project_id": {"type": "integer"}},
@@ -60,12 +60,19 @@ TOOLS = [
     },
     {
         "name": "annotate_task",
-        "description": "Annotate every image in a task from the project requirement. This can take several minutes.",
+        "description": "Annotate every image in a task from the project requirement, or from the project's CVAT labels when no requirement document was uploaded. This can take several minutes.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "project_id": {"type": "integer"},
                 "task_id": {"type": "integer"},
+                "start_frame": {"type": "integer", "description": "First image to annotate. The first image is 0."},
+                "end_frame": {"type": "integer", "description": "Last image to annotate."},
+                "frames": {"type": "string", "description": "Single images or ranges, for example 0-4, 9, 12-15."},
+                "only_new": {
+                    "type": "boolean",
+                    "description": "Skip images that already have shapes. Use this after images were added to a task.",
+                },
             },
             "required": ["project_id", "task_id"],
         },
@@ -90,7 +97,7 @@ TOOLS = [
     },
     {
         "name": "update_requirement",
-        "description": "Change the saved requirement and the CVAT labels. Use this when the user wants labels removed, kept, renamed, retyped, or added, or when they name the client export format, even if those labels are already in the requirement.",
+        "description": "Change the saved requirement and persist the changes to CVAT. Use this for label changes and for adding, updating, or removing attributes on existing CVAT labels. For example, a request to give car a color attribute with values red, black, blue must call this tool with add_attributes=[{label: car, name: color, input_type: select, values: [red, black, blue]}]. Read back CVAT labels before reporting success.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -129,13 +136,37 @@ TOOLS = [
                     "type": "string",
                     "description": "The client delivery format named in chat, such as COCO, YOLO, VOC, LabelMe, CSV, KITTI, or MOT.",
                 },
+                "add_attributes": {
+                    "type": "array",
+                    "description": "Attributes to add to an existing label, or to update by name. Use select or radio with values for a fixed list, checkbox for yes/no, number for a measure, text for free entry.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string"},
+                            "name": {"type": "string"},
+                            "input_type": {"type": "string", "enum": ["select", "radio", "checkbox", "number", "text"]},
+                            "values": {"type": "array", "items": {"type": "string"}},
+                            "default": {"type": "string"},
+                            "mutable": {"type": "boolean"},
+                        },
+                        "required": ["label", "name", "input_type"],
+                    },
+                },
+                "remove_attributes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"label": {"type": "string"}, "name": {"type": "string"}},
+                        "required": ["label", "name"],
+                    },
+                },
             },
             "required": ["project_id"],
         },
     },
     {
         "name": "analyze_requirement",
-        "description": "Read the project's saved requirement again and apply its labels, skeleton joints, and bones.",
+        "description": "Read the project's saved requirement again and apply its labels, attributes, skeleton joints, and bones to CVAT, then verify the saved label configuration.",
         "input_schema": {
             "type": "object",
             "properties": {"project_id": {"type": "integer"}},
@@ -234,6 +265,11 @@ When the user says something is wrong, or asks to change labels or the requireme
 - the user names a client format, attaches an example, or asks to export or download: the server builds the zip from the requirement example. Tell them the file is downloading. Never say you cannot generate or download the export.
 - wrong shapes on a task: call clear_annotations, then annotate_task
 - a new requirement file is attached: call apply_requirement
+- the user asks to add, change, or remove an attribute on a label (for example a colour on a mirror): call update_requirement with add_attributes or remove_attributes. Use select with values for a fixed list, checkbox for yes/no, number for a measure, text for free entry. Then read attributes_in_cvat in the result and tell the user what CVAT now holds. Never say you cannot create attributes.
+- For example, "give the car label color attribute values red, black, blue" means add or update a select attribute named color on the existing car label with exactly those three values. Call update_requirement now; do not suggest making separate labels or editing CVAT manually.
+- the requirement describes attributes in sentences: call analyze_requirement. It reads them and adds them to the CVAT labels.
+- images were added to a task, or the user names images, a range, or a start and end frame: call annotate_task with only_new, start_frame and end_frame, or frames. Frame numbers start at 0. Do not redraw the other images.
+- the project or task was made by hand in CVAT with labels but no requirement document: the labels in CVAT are the requirement. Call annotate_task. The agent learns from what people draw by hand. Never ask for a document first.
 - image files are attached: call add_images on the current task, unless the user asked to replace the images or create a new task
 Do the change. Do not tell the user to upload a revised document or to click another button.
 Delete a project or task only when the user asked to delete it.
@@ -244,6 +280,13 @@ After you create or replace a project or task, include its id.
 
 def run_tool(name: str, arguments: dict, client: CvatClient, session, settings: Settings, upload: dict) -> str:
     try:
+        if name in {"project_details", "fix_labels", "update_requirement", "analyze_requirement", "annotate_task"}:
+            if arguments.get("project_id"):  # labels added by hand in CVAT count as the requirement
+                service.sync_spec_from_cvat(
+                    session,
+                    get_project(session, int(arguments["project_id"])),
+                    client.get_labels(int(arguments["project_id"])),
+                )
         if name == "list_projects":
             rows = client.list_projects()
             return json.dumps([{"id": row.get("id"), "name": row.get("name")} for row in rows])
@@ -286,18 +329,33 @@ def run_tool(name: str, arguments: dict, client: CvatClient, session, settings: 
             state = get_project(session, project_id)
             from .main import _with_guide
 
-            parsed = _with_guide(parsed, upload.get("text") or "", settings)
+            existing = client.get_labels(project_id)
+            parsed = _with_guide(
+                parsed,
+                upload.get("text") or "",
+                settings,
+                upload.get("visuals") or [],
+                existing,
+            )
+            from .main import (
+                _apply_and_verify_labels,
+                _attribute_sync_report,
+                _cvat_label_attribute_json,
+                _record_configuration_status,
+            )
+
+            diff = spec.diff_labels(parsed, existing)
+            applied, actual = _apply_and_verify_labels(client, project_id, parsed, existing, diff, False)
+            _record_configuration_status(parsed, diff, actual)
             service.save_spec(session, state, upload.get("document_name") or "requirement", parsed)
-            labels = client.get_labels(project_id)
-            diff = spec.diff_labels(parsed, labels)
-            patch = service.label_patch(diff, labels, False)
-            if patch:
-                client.patch_project_labels(project_id, patch)
+            state.spec_json = dict(parsed)
             return json.dumps({
                 "project_id": project_id,
-                "applied": len(patch),
+                "applied": applied,
                 "labels": [item["name"] for item in parsed.get("labels") or []],
                 "questions": parsed.get("questions") or [],
+                "attribute_sync": _attribute_sync_report(parsed, actual),
+                "cvat_attribute_json": _cvat_label_attribute_json(actual),
             })
         if name == "project_details":
             project_id = int(arguments["project_id"])
@@ -355,17 +413,50 @@ def run_tool(name: str, arguments: dict, client: CvatClient, session, settings: 
                 add=arguments.get("add_labels"),
                 type_changes=arguments.get("type_changes"),
                 output_format=arguments.get("output_format"),
+                add_attributes=arguments.get("add_attributes"),
+                remove_attributes=arguments.get("remove_attributes"),
             )
             if not (state.spec_json or {}).get("labels") and not updated.get("labels"):
                 return "This project has no requirement yet. Attach the requirement document first."
-            _rename_cvat_labels(client, project_id, arguments.get("rename") or [])
+            attr_only = bool(arguments.get("add_attributes") or arguments.get("remove_attributes")) and not any(
+                arguments.get(key) for key in (
+                    "remove_labels", "keep_labels", "rename", "add_labels", "type_changes", "output_format"
+                )
+            )
+            if attr_only:
+                applied = _sync_attribute_changes(
+                    client,
+                    project_id,
+                    updated,
+                    arguments.get("add_attributes") or [],
+                    arguments.get("remove_attributes") or [],
+                )
+            else:
+                _rename_cvat_labels(client, project_id, arguments.get("rename") or [])
+                applied = _sync_labels(client, project_id, updated)
             service.save_spec(session, state, "requirement", updated)
-            applied = _sync_labels(client, project_id, updated)
+            # Report what CVAT really holds now, so the answer never claims a change that did not happen.
+            in_cvat = {
+                item.get("name"): [
+                    {
+                        "id": a.get("id"),
+                        "name": a.get("name"),
+                        "input_type": a.get("input_type"),
+                        "values": a.get("values"),
+                        "default_value": a.get("default_value"),
+                        "mutable": a.get("mutable"),
+                    }
+                    for a in item.get("attributes") or []
+                ]
+                for item in client.get_labels(project_id)
+                if not (item.get("parent_id") or item.get("has_parent"))
+            }
             return json.dumps({
                 "project_id": project_id,
                 "labels": [item.get("name") for item in updated.get("labels") or []],
                 "output_format": updated.get("output_format") or "CVAT",
                 "applied": applied,
+                "attributes_in_cvat": in_cvat,
             })
         if name == "analyze_requirement":
             project_id = int(arguments["project_id"])
@@ -376,13 +467,28 @@ def run_tool(name: str, arguments: dict, client: CvatClient, session, settings: 
                 return "This project has no requirement yet. Attach the requirement document first."
             from .main import _with_guide
 
-            parsed = _with_guide(parsed, text, settings)
+            existing = client.get_labels(project_id)
+            requirement_path = _saved_requirement_path(settings, project_id)
+            images = spec.read_document_images(requirement_path) if requirement_path else []
+            parsed = _with_guide(parsed, text, settings, images, existing)
+            from .main import (
+                _apply_and_verify_labels,
+                _attribute_sync_report,
+                _cvat_label_attribute_json,
+                _record_configuration_status,
+            )
+
+            diff = spec.diff_labels(parsed, existing)
+            applied, actual = _apply_and_verify_labels(client, project_id, parsed, existing, diff, False)
+            _record_configuration_status(parsed, diff, actual)
             service.save_spec(session, state, document_name, parsed)
-            applied = _sync_labels(client, project_id, parsed)
+            state.spec_json = dict(parsed)
             return json.dumps({
                 "project_id": project_id,
                 "applied": applied,
                 "labels": [item.get("name") for item in parsed.get("labels") or []],
+                "attribute_sync": _attribute_sync_report(parsed, actual),
+                "cvat_attribute_json": _cvat_label_attribute_json(actual),
             })
         if name == "rename_project":
             project_id = int(arguments["project_id"])
@@ -433,15 +539,24 @@ def run_tool(name: str, arguments: dict, client: CvatClient, session, settings: 
             state = get_project(session, project_id)
             state.annotation_mode = "auto_first"
             state.learn_enabled = True
-            from .main import run_annotation
+            from .main import _frame_scope, run_annotation
 
+            scope = _frame_scope(
+                arguments.get("start_frame"), arguments.get("end_frame"), arguments.get("frames"), arguments.get("only_new")
+            )
             run = Run(cvat_project_id=project_id, task_id=task_id, status="running", mode="auto_first")
             session.add(run)
             session.flush()
-            summary = run_annotation(session, client, state, task_id, run, settings)
+            summary = run_annotation(session, client, state, task_id, run, settings, scope=scope)
             return json.dumps({"task_id": task_id, "written": summary.get("written"), "message": summary.get("message")})
-    except (CvatError, KeyError, ValueError, TypeError) as exc:
-        return f"That action failed: {exc}"[:400]
+    except CvatError as exc:
+        try:
+            detail = json.loads(exc.detail)
+        except (TypeError, json.JSONDecodeError):
+            detail = exc.detail
+        return json.dumps({"error": "CVAT rejected or did not persist the change", "http_status": exc.status, "response_body": detail})
+    except (KeyError, ValueError, TypeError) as exc:
+        return f"That action failed: {exc}"[:2000]
     return "Unknown action."
 
 
@@ -576,10 +691,19 @@ def _complete(api_key, model, conversation, client, session, settings, upload) -
 
 
 def read_upload(files: list[tuple[str, bytes]], data_dir: Path) -> dict:
-    upload = {"images": [], "spec": None, "document_name": ""}
+    upload = {"images": [], "visuals": [], "spec": None, "document_name": ""}
     for name, content in files:
         suffix = Path(name).suffix.lower()
         if suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".zip"} or is_video_name(name):
+            if suffix != ".zip" and not is_video_name(name):
+                image_path = data_dir / "chat" / Path(name).name
+                image_path.parent.mkdir(parents=True, exist_ok=True)
+                image_path.write_bytes(content)
+                upload["visuals"].extend(spec.read_document_images(image_path))
+                if not upload.get("spec"):
+                    upload["text"] = ""
+                    upload["spec"] = spec.extract_spec("")
+                    upload["document_name"] = Path(name).name
             upload["images"].append((Path(name).name, content))
             continue
         target = data_dir / "chat" / Path(name).name
@@ -588,6 +712,7 @@ def read_upload(files: list[tuple[str, bytes]], data_dir: Path) -> dict:
         try:
             upload["text"] = spec.read_document(target)
             upload["spec"] = spec.extract_spec(upload["text"])
+            upload["visuals"] = spec.read_document_images(target)
             upload["document_name"] = Path(name).name
         except ValueError:
             continue
@@ -606,6 +731,8 @@ def revise_spec(
     add: list | None = None,
     type_changes: list | None = None,
     output_format: str | None = None,
+    add_attributes: list | None = None,
+    remove_attributes: list | None = None,
 ) -> dict:
     """Apply a chat instruction to the saved requirement labels."""
     updated = copy.deepcopy(parsed or {})
@@ -635,6 +762,16 @@ def revise_spec(
             continue
         labels.append({"name": name, "type": item.get("type") or "rectangle", "attributes": []})
         names.add(_label_key(name))
+    for item in add_attributes or []:
+        for label in labels:
+            if _label_key(label.get("name")) == _label_key(item.get("label")):
+                spec.merge_attributes(label, [item])
+    for item in remove_attributes or []:
+        for label in labels:
+            if _label_key(label.get("name")) == _label_key(item.get("label")):
+                label["attributes"] = [
+                    attr for attr in label.get("attributes") or [] if _label_key(attr.get("name")) != _label_key(item.get("name"))
+                ]
     updated["labels"] = labels
     if output_format and str(output_format).strip():
         updated["output_format"] = str(output_format).strip()
@@ -658,6 +795,124 @@ def _rename_cvat_labels(client: CvatClient, project_id: int, rename: list) -> No
                 patch.append({"id": label["id"], "name": target})
     if patch:
         client.patch_project_labels(project_id, patch)
+
+
+def _sync_attribute_changes(
+    client: CvatClient,
+    project_id: int,
+    parsed: dict,
+    additions: list[dict],
+    removals: list[dict],
+) -> int:
+    """Apply only explicitly requested attribute edits, preserving every project label."""
+    from .main import _apply_and_verify_labels, _record_configuration_status
+
+    conflicts = {
+        (_label_key(item.get("label")), _label_key(item.get("name")))
+        for item in additions or []
+    } & {
+        (_label_key(item.get("label")), _label_key(item.get("name")))
+        for item in removals or []
+    }
+    if conflicts:
+        raise ValueError("The same attribute cannot be added and removed in one change.")
+
+    actual = client.get_labels(project_id)
+    top_labels = [item for item in actual if not item.get("parent_id") and not item.get("has_parent")]
+    current_by_name = {_label_key(item.get("name")): item for item in top_labels}
+    wanted_by_name = {
+        _label_key(item.get("name")): item for item in parsed.get("labels") or [] if item.get("name")
+    }
+    additions_by_label: dict[str, set[str]] = {}
+    removals_by_label: dict[str, set[str]] = {}
+    for item in additions or []:
+        label_key = _label_key(item.get("label"))
+        name_key = _label_key(item.get("name"))
+        if not label_key or not name_key:
+            raise ValueError("An attribute update needs both a label name and an attribute name.")
+        additions_by_label.setdefault(label_key, set()).add(name_key)
+    for item in removals or []:
+        label_key = _label_key(item.get("label"))
+        name_key = _label_key(item.get("name"))
+        if not label_key or not name_key:
+            raise ValueError("Removing an attribute needs both a label name and an attribute name.")
+        removals_by_label.setdefault(label_key, set()).add(name_key)
+
+    targeted_labels = []
+    for label_key, names in additions_by_label.items():
+        current = current_by_name.get(label_key)
+        wanted = wanted_by_name.get(label_key)
+        if current is None or wanted is None:
+            raise CvatError(404, f"The CVAT label '{label_key}' does not exist.")
+        wanted_attrs = [
+            dict(attr)
+            for attr in wanted.get("attributes") or []
+            if _label_key(attr.get("name")) in names
+        ]
+        if { _label_key(attr.get("name")) for attr in wanted_attrs } != names:
+            raise ValueError(f"An attribute change for label '{current.get('name')}' was not present in the saved requirement.")
+        targeted_labels.append({
+            "name": current.get("name"),
+            "type": current.get("type") or wanted.get("type") or "rectangle",
+            "attributes": wanted_attrs,
+        })
+
+    applied = 0
+    diff = {"create": [], "update": [], "unchanged": [], "blocked": []}
+    if targeted_labels:
+        subset = {"labels": targeted_labels}
+        diff = spec.diff_labels(subset, actual)
+        applied, actual = _apply_and_verify_labels(client, project_id, subset, actual, diff, False)
+        _record_configuration_status(parsed, diff, actual)
+
+    for attempt in range(2):
+        actual_by_name = {
+            _label_key(item.get("name")): item
+            for item in actual
+            if not item.get("parent_id") and not item.get("has_parent")
+        }
+        delete_payload: dict[int, dict] = {}
+        for label_key, names in removals_by_label.items():
+            current = actual_by_name.get(label_key)
+            if current is None or current.get("id") is None:
+                raise CvatError(404, f"The CVAT label '{label_key}' does not exist.")
+            for attr in current.get("attributes") or []:
+                if _label_key(attr.get("name")) not in names or attr.get("id") is None:
+                    continue
+                label_id = int(current["id"])
+                body = delete_payload.setdefault(label_id, {"id": label_id, "attributes": []})
+                body["attributes"].append({"id": int(attr["id"]), "deleted": True})
+        if delete_payload:
+            client.patch_project_labels(project_id, list(delete_payload.values()))
+            applied += len(delete_payload)
+        actual = client.get_labels(project_id)
+        after_by_name = {
+            _label_key(item.get("name")): item
+            for item in actual
+            if not item.get("parent_id") and not item.get("has_parent")
+        }
+        missing = [
+            {"label": label_key, "attribute": name}
+            for label_key, names in removals_by_label.items()
+            for name in names
+            if any(_label_key(attr.get("name")) == name for attr in (after_by_name.get(label_key) or {}).get("attributes") or [])
+        ]
+        if not missing:
+            break
+        if attempt:
+            raise CvatError(502, json.dumps({"message": "CVAT did not remove the requested attributes", "attributes": missing}))
+
+    required_errors = _attribute_errors_for_targets(targeted_labels, actual)
+    if required_errors:
+        raise CvatError(502, json.dumps({"message": "CVAT did not persist the requested attributes", "mismatches": required_errors}))
+    _record_configuration_status(parsed, diff, actual)
+    return applied
+
+
+def _attribute_errors_for_targets(labels: list[dict], actual: list[dict]) -> list[dict]:
+    from .main import _attribute_configuration_errors
+
+    return _attribute_configuration_errors({"labels": labels}, actual)
 
 
 def _sync_labels(client: CvatClient, project_id: int, parsed: dict) -> int:
@@ -684,17 +939,21 @@ def _task_in_project(client: CvatClient, project_id: int, task_id: int) -> dict:
 
 
 def _saved_requirement_text(settings: Settings, project_id: int) -> tuple[str, str]:
-    folder = Path(settings.analyzer_data_dir) / "uploads" / str(project_id)
-    if not folder.exists():
+    latest = _saved_requirement_path(settings, project_id)
+    if latest is None:
         return "", "requirement"
-    files = [path for path in folder.iterdir() if path.is_file()]
-    if not files:
-        return "", "requirement"
-    latest = max(files, key=lambda path: path.stat().st_mtime)
     try:
         return spec.read_document(latest), latest.name
     except ValueError:
         return "", latest.name
+
+
+def _saved_requirement_path(settings: Settings, project_id: int) -> Path | None:
+    folder = Path(settings.analyzer_data_dir) / "uploads" / str(project_id)
+    if not folder.exists():
+        return None
+    files = [path for path in folder.iterdir() if path.is_file()]
+    return max(files, key=lambda path: path.stat().st_mtime) if files else None
 
 
 def _unique_name(name: str, used: set[str]) -> str:

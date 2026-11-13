@@ -1,9 +1,10 @@
-"""Requirement documents become an annotation spec and a CVAT label diff."""
+﻿"""Requirement documents become an annotation spec and a CVAT label diff."""
 
 from __future__ import annotations
 
 import json
 import re
+import zipfile
 from pathlib import Path
 
 TYPE_MAP = {
@@ -11,6 +12,8 @@ TYPE_MAP = {
     "box": "rectangle",
     "bbox": "rectangle",
     "bounding_box": "rectangle",
+    "2d bounding box": "rectangle",
+    "bbox annotation": "rectangle",
     "boundingbox": "rectangle",
     "polygon": "polygon",
     "segmentation": "polygon",
@@ -106,6 +109,29 @@ BODY_LAYOUT = {
 }
 
 INPUT_TYPES = {"select", "radio", "checkbox", "number", "text"}
+# Other names a requirement may use for CVAT's five attribute types.
+INPUT_ALIASES = {
+    "dropdown": "select",
+    "drop-down": "select",
+    "drop down": "select",
+    "combobox": "select",
+    "list": "select",
+    "radio button": "radio",
+    "radio buttons": "radio",
+    "choice": "radio",
+    "boolean": "checkbox",
+    "bool": "checkbox",
+    "yes/no": "checkbox",
+    "check box": "checkbox",
+    "integer": "number",
+    "int": "number",
+    "float": "number",
+    "numeric": "number",
+    "string": "text",
+    "free text": "text",
+    "textbox": "text",
+}
+IMMUTABLE_WORDS = {"no", "false", "immutable", "fixed", "constant", "same", "per object"}
 
 
 def read_document(path: Path) -> str:
@@ -116,19 +142,72 @@ def read_document(path: Path) -> str:
         from pypdf import PdfReader
 
         reader = PdfReader(str(path))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
+        # Layout mode preserves table columns in PDFs whose rows otherwise become
+        # unrelated vertical text fragments (for example, attribute keys in one
+        # column and allowed values in another).
+        pages = []
+        for page in reader.pages:
+            content = ""
+            try:
+                content = page.extract_text(extraction_mode="layout") or ""
+            except (TypeError, ValueError):
+                pass
+            # Older PDFs/pypdf versions may return fragmented text or lack layout
+            # support. Keep any useful layout result, otherwise use ordinary text.
+            if len(content.strip()) < 80:
+                content = page.extract_text() or content
+            pages.append(content)
+        return "\n".join(pages)
     if suffix == ".docx":
         import docx
 
         document = docx.Document(str(path))
         chunks = [paragraph.text for paragraph in document.paragraphs]
-        for table in document.tables:
+        for table_index, table in enumerate(document.tables):
+            chunks.append(f"[DOCX TABLE {table_index}]")
             for row in table.rows:
-                cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-                if cells:
-                    chunks.append(" | ".join(dict.fromkeys(cells)))
+                cells = [cell.text.strip() for cell in row.cells]
+                if any(cells):
+                    chunks.append(" | ".join(cells))
         return "\n".join(chunks)
+    if suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}:
+        return ""
     raise ValueError(f"Unsupported document type {suffix or '(none)'}")
+
+
+def read_document_images(path: Path) -> list[dict]:
+    """Extract embedded images so screenshots, scans, and illustrated tables reach vision analysis."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    suffix = path.suffix.lower()
+    candidates: list[tuple[str, bytes]] = []
+    if suffix == ".pdf":
+        from pypdf import PdfReader
+
+        for page_number, page in enumerate(PdfReader(str(path)).pages, start=1):
+            for image_index, image in enumerate(getattr(page, "images", []) or [], start=1):
+                candidates.append((f"page-{page_number}-image-{image_index}", image.data))
+    elif suffix == ".docx":
+        with zipfile.ZipFile(path) as archive:
+            for name in sorted(archive.namelist()):
+                if name.startswith("word/media/") and not name.endswith("/"):
+                    candidates.append((Path(name).name, archive.read(name)))
+    elif suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}:
+        candidates.append((path.name, path.read_bytes()))
+
+    visuals = []
+    for name, raw in candidates:
+        try:
+            picture = Image.open(BytesIO(raw)).convert("RGB")
+            picture.thumbnail((1568, 1568))
+            output = BytesIO()
+            picture.save(output, format="JPEG", quality=82)
+        except Exception:
+            continue
+        visuals.append({"name": name, "media_type": "image/jpeg", "data": output.getvalue()})
+    return visuals
 
 
 def _json_block(text: str) -> dict | None:
@@ -315,7 +394,7 @@ def _connection_lines(text: str) -> list[str]:
 def _one_pair(piece: str) -> tuple[str, str] | None:
     piece = piece.strip(" .;|")
     piece = re.sub(r"^\d+[\).\]]\s*", "", piece)
-    for separator in (" to ", " -> ", " → ", " — ", " – ", " - "):
+    for separator in (" to ", " -> ", " â†’ ", " â€” ", " â€“ ", " - "):
         if separator in piece:
             left, right = piece.split(separator, 1)
             left, right = left.strip(), right.strip()
@@ -326,7 +405,7 @@ def _one_pair(piece: str) -> tuple[str, str] | None:
         left, right = left.strip(), right.strip()
         if left and right and not left.isdigit() and not right.isdigit():
             return left, right
-    numbers = re.fullmatch(r"(\d+)\s*[-–—]\s*(\d+)", piece)
+    numbers = re.fullmatch(r"(\d+)\s*[-â€“â€”]\s*(\d+)", piece)
     if numbers:
         return numbers.group(1), numbers.group(2)
     cells = [cell.strip() for cell in piece.split("|") if cell.strip()]
@@ -476,12 +555,12 @@ def extract_spec(text: str) -> dict:
             keypoints = list(HUMAN_KEYPOINTS)
         edges = skeleton_edges(section, keypoints) if mapped == "skeleton" else []
         attributes = []
-        for attr_name, input_type, values, default, required in re.findall(
-            r"Attribute\s*:\s*(.+)\nInput\s*:\s*(.+)\nValues\s*:\s*(.*)\nDefault\s*:\s*(.*)\nRequired\s*:\s*(.+)",
+        for attr_name, input_type, values, default, required, mutable in re.findall(
+            r"Attribute\s*:\s*(.+)\nInput\s*:\s*(.+)\nValues\s*:\s*(.*)\nDefault\s*:\s*(.*)\nRequired\s*:\s*(.+)(?:\nMutable\s*:\s*(.+))?",
             block,
             flags=re.I,
         ):
-            input_name = input_type.strip().lower()
+            input_name = INPUT_ALIASES.get(input_type.strip().lower(), input_type.strip().lower())
             value_list = [item.strip() for item in values.split(",") if item.strip()]
             if input_name not in INPUT_TYPES:
                 questions.append(
@@ -505,11 +584,13 @@ def extract_spec(text: str) -> dict:
                     "values": value_list,
                     "default": default.strip(),
                     "required": required.strip().lower() in {"yes", "true", "required"},
+                    # Changes from frame to frame on a video track unless the requirement says it is fixed.
+                    "mutable": mutable.strip().lower() not in IMMUTABLE_WORDS if mutable.strip() else True,
                 }
             )
-        known = {item["name"] for item in attributes}
+        known = {item["name"].casefold() for item in attributes}
         for attr_name, sample in ((examples.get(name) or {}).get("attributes") or {}).items():
-            if attr_name not in known:
+            if attr_name.casefold() not in known:
                 attributes.append(
                     {
                         "name": attr_name,
@@ -543,6 +624,14 @@ def extract_spec(text: str) -> dict:
     if not labels:
         labels.extend(_labels_from_skeleton_properties(text))
     if not labels:
+        table_spec = _vehicle_detection_doc_spec(text or "")
+        if table_spec:
+            return table_spec
+    if not labels:
+        table_spec = _vehicle_attribute_table_spec(text or "")
+        if table_spec:
+            return table_spec
+    if not labels:
         questions.append(
             {
                 "id": "labels",
@@ -554,6 +643,119 @@ def extract_spec(text: str) -> dict:
         "output_format": output_format,
         "questions": questions,
         "tracking": _wants_tracking(text),
+    }
+
+
+def _vehicle_attribute_table_spec(text: str) -> dict | None:
+    """Read the client's tabular vehicle-label and suggested-attribute template.
+
+    These forms list explicit classes and candidate property values, but often
+    have no Label:/Attribute: blocks. Treat a property's listed choices as
+    suggestions and leave its CVAT default blank; client decision checkboxes
+    are not machine-readable selections.
+    """
+    lowered = (text or "").casefold()
+    if not re.search(r"vehicle\s+attributes|required\s+attributes|attribute\s+key", lowered):
+        return None
+    label_table = re.search(r"(?m)^Label\s*\|\s*Definition\s*/\s*inclusion rule\s*\|\s*Examples\s*$", text or "", re.I)
+    labels = []
+    if label_table:
+        for line in (text or "")[label_table.end():].splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("|"):
+                if labels:
+                    break
+                continue
+            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+            if len(cells) < 3 or cells[0].casefold() in {"label", "---"}:
+                continue
+            name = cells[0]
+            if re.fullmatch(r"[a-z][a-z0-9_]*", name):
+                labels.append(name)
+    else:
+        names = ["car", "truck", "bus", "van", "motorcycle", "bicycle", "other_vehicle"]
+        if all(re.search(rf"\b{re.escape(name)}\b", lowered) for name in names):
+            labels = names
+    if not labels:
+        return None
+
+    rows: dict[str, dict] = {}
+    # pypdf's default extraction can place the key and values on separate lines.
+    # Pair only a known attribute key with an immediately following, enumerated
+    # choices line; descriptions and decision instructions are never choices.
+    attr_table = re.search(r"(?m)^Attribute\s*\|\s*Allowed values\s*\|\s*Annotation instruction\s*$", text or "", re.I)
+    if attr_table:
+        for line in (text or "")[attr_table.end():].splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("|"):
+                if rows:
+                    break
+                continue
+            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+            if len(cells) < 3 or cells[0].casefold() == "attribute":
+                continue
+            name, raw_values = cells[0], cells[1]
+            values = [value.strip() for value in raw_values.split(",") if value.strip()]
+            if re.fullmatch(r"[a-z][a-z0-9_]*", name) and len(values) >= 2:
+                rows[name] = {"name": name, "input_type": "select", "values": values, "default": "", "required": True, "mutable": True}
+
+    result_labels = [{
+        "name": name, "type": "rectangle", "attributes": [dict(item) for item in rows.values()],
+        "min_size": None, "special_rules": [], "detect_as": [], "type_locked": False,
+        "keypoints": [], "edges": [],
+    } for name in labels]
+    return {
+        "labels": result_labels, "output_format": named_format(text) or "CVAT", "questions": [],
+        "tracking": _wants_tracking(text),
+    }
+
+
+def _vehicle_detection_doc_spec(text: str) -> dict | None:
+    """Parse the DOCX vehicle detection requirement's explicitly approved tables."""
+    lowered = (text or "").casefold()
+    if "vehicle detection" not in lowered or "required attributes" not in lowered:
+        return None
+    lines = (text or "").splitlines()
+    tables: dict[int, list[list[str]]] = {}
+    table_index = None
+    for line in lines:
+        marker = re.fullmatch(r"\[DOCX TABLE (\d+)\]", line.strip(), re.I)
+        if marker:
+            table_index = int(marker.group(1))
+            tables[table_index] = []
+            continue
+        if table_index is not None and "|" in line:
+            tables[table_index].append([cell.strip() for cell in line.strip().strip("|").split("|")])
+    taxonomy_rows = next((rows[1:] for rows in tables.values() if rows and rows[0][0].casefold() == "label" and len(rows[0]) >= 3), None)
+    if not taxonomy_rows:
+        return None
+    labels = [tuple(row[:3]) for row in taxonomy_rows if len(row) >= 3 and re.fullmatch(r"[a-z][a-z0-9_]*", row[0], re.I)]
+    if not labels:
+        return None
+    attribute_tables = [rows for rows in tables.values() if rows and rows[0][0].casefold() == "attribute"]
+    required_attrs = []
+    optional_attrs = []
+    if attribute_tables:
+        for table, target in ((attribute_tables[0], required_attrs), (attribute_tables[1] if len(attribute_tables) > 1 else [], optional_attrs)):
+            for row in table[1:]:
+                if len(row) < 3:
+                    continue
+                name, raw_values = row[0], row[1]
+                values = [value.strip() for value in raw_values.split(",") if value.strip() and value.strip().casefold() != "etc."]
+                if re.fullmatch(r"[a-z][a-z0-9_]*", name, re.I) and len(values) >= 2:
+                    target.append({"name": name, "input_type": "select", "values": values, "default": "", "required": target is required_attrs, "mutable": True})
+    parsed_labels = []
+    for name, definition, examples in labels:
+        attrs = [dict(item) for item in required_attrs]
+        parsed_labels.append({
+            "name": name, "type": "rectangle", "attributes": attrs,
+            "min_size": None, "special_rules": [definition], "detect_as": [],
+            "type_locked": True, "keypoints": [], "edges": [],
+        })
+    return {
+        "labels": parsed_labels, "output_format": named_format(text) or "CVAT",
+        "questions": [], "tracking": _wants_tracking(text),
+        "optional_attributes_not_applied": [item["name"] for item in optional_attrs],
     }
 
 
@@ -629,6 +831,74 @@ def _labels_from_skeleton_properties(text: str) -> list[dict]:
             "edges": edges,
         }
     ]
+
+
+def clean_attribute(raw: dict) -> dict | None:
+    """One attribute as a requirement stores it, using CVAT's five input types."""
+    if not isinstance(raw, dict):
+        return None
+    name = str(raw.get("name") or "").strip()
+    if not name:
+        return None
+    kind = str(raw.get("input_type") or raw.get("type") or "text").strip().lower()
+    kind = INPUT_ALIASES.get(kind, kind)
+    if kind not in INPUT_TYPES:
+        kind = "text"
+    values = raw.get("values")
+    if isinstance(values, str):
+        values = values.split(",")
+    values = [str(item).strip() for item in values or [] if str(item).strip()]
+    if kind in {"select", "radio"} and not values:
+        kind = "text"  # a fixed list needs its values; without them the field is free entry
+    default = "" if raw.get("default") is None else str(raw.get("default")).strip()
+    mutable = raw.get("mutable", True)
+    if isinstance(mutable, str):
+        mutable = mutable.strip().lower() not in IMMUTABLE_WORDS
+    return {
+        "name": name,
+        "input_type": kind,
+        "values": values,
+        "default": default,
+        "required": bool(raw.get("required")),
+        "mutable": bool(mutable),
+    }
+
+
+def merge_attributes(label: dict, incoming: list) -> list[str]:
+    """Add attributes to a requirement label, or update the ones it already has by name.
+
+    Returns the names that were added or changed.
+    """
+    attributes = label.setdefault("attributes", [])
+    existing = {str(item.get("name") or "").strip().casefold(): item for item in attributes}
+    changed: list[str] = []
+    for raw in incoming or []:
+        clean = clean_attribute(raw)
+        if clean is None:
+            continue
+        found = existing.get(clean["name"].casefold())
+        if found is None:
+            attributes.append(clean)
+            existing[clean["name"].casefold()] = clean
+            changed.append(clean["name"])
+            continue
+        for key in ("input_type", "values", "default", "mutable"):
+            if key in raw and raw[key] not in (None, "") and found.get(key) != clean[key]:
+                found[key] = clean[key]
+                if clean["name"] not in changed:
+                    changed.append(clean["name"])
+    return changed
+
+
+def attribute_text(attributes: list) -> str:
+    parts = []
+    for item in attributes or []:
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        kind = item.get("input_type") or "text"
+        values = ", ".join(str(v) for v in item.get("values") or [])
+        parts.append(f"{item['name']} ({kind}{': ' + values if values else ''})")
+    return ", ".join(parts)
 
 
 def explain_requirement(spec: dict) -> dict:
@@ -753,6 +1023,8 @@ def apply_guide(spec: dict, guide: dict) -> dict:
             label["edges"] = edges
         if label.get("type") == "skeleton" and not label.get("keypoints") and _body_label(label["name"], ""):
             label["keypoints"] = list(HUMAN_KEYPOINTS)
+        if isinstance(decision.get("attributes"), list):
+            merge_attributes(label, decision["attributes"])
         label["why_this_type"] = decision.get("why_this_type") or ""
         label["how_to_annotate"] = decision.get("how_to_annotate") or ""
         label["how_to_decide"] = decision.get("how_to_decide") or ""
@@ -766,7 +1038,10 @@ def apply_guide(spec: dict, guide: dict) -> dict:
                 "why_this_type": label.get("why_this_type") or "",
                 "how_to_annotate": label.get("how_to_annotate") or "",
                 "how_to_decide": label.get("how_to_decide") or "",
-                "attributes": (by_name.get(label["name"]) or {}).get("attributes") or "",
+                "attributes": attribute_text(label.get("attributes"))
+                or (by_name.get(label["name"]) or {}).get("attributes")
+                if not isinstance((by_name.get(label["name"]) or {}).get("attributes"), list)
+                else attribute_text(label.get("attributes")),
                 "keypoints": list(label.get("keypoints") or []),
             }
             for label in updated.get("labels") or []
@@ -818,14 +1093,20 @@ def diff_labels(spec: dict, existing: list[dict]) -> dict:
                 create.append(label)
             continue
         type_change = label.get("type") not in {None, "any", current.get("type")}
-        current_attrs = {attr["name"]: attr for attr in current.get("attributes") or []}
+        current_attrs = {str(attr.get("name") or "").casefold(): attr for attr in current.get("attributes") or []}
         attr_changes = []
         for attr in label.get("attributes") or []:
-            found = current_attrs.get(attr["name"])
+            found = current_attrs.get(str(attr["name"]).casefold())
             if found is None:
                 attr_changes.append({"action": "add", **attr})
-            elif found.get("input_type") != attr.get("input_type") or list(found.get("values") or []) != list(
-                attr.get("values") or []
+            elif found.get("input_type") != attr.get("input_type") or (
+                "mutable" in attr and bool(found.get("mutable", True)) != bool(attr.get("mutable"))
+            ) or (
+                # CVAT keeps a checkbox's default in `values`, so only the other types compare them
+                attr.get("input_type") != "checkbox"
+                and list(found.get("values") or []) != list(attr.get("values") or [])
+            ) or (
+                _effective_attribute_default(found) != _effective_attribute_default(attr, requirement=True)
             ):
                 attr_changes.append({"action": "change", "id": found.get("id"), **attr})
         if not type_change and not attr_changes:
@@ -853,6 +1134,18 @@ def diff_labels(spec: dict, existing: list[dict]) -> dict:
         if attr_changes:
             update.append(entry)
     return {"create": create, "update": update, "unchanged": unchanged, "blocked": blocked}
+
+
+def _effective_attribute_default(attribute: dict, requirement: bool = False) -> str | None:
+    """Normalize CVAT and requirement defaults the same way the writer will."""
+    from .attributes import _default
+
+    kind = attribute.get("input_type") or "text"
+    values = list(attribute.get("values") or [])
+    default = attribute.get("default") if requirement else attribute.get("default_value")
+    if default is None and not requirement:
+        default = attribute.get("default")
+    return _default({"input_type": kind, "values": values, "default_value": default})
 
 
 def to_cvat_attributes(attributes: list[dict], existing: dict[str, dict] | None = None) -> list[dict]:

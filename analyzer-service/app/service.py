@@ -7,12 +7,15 @@ import json
 import logging
 import math
 import os
-from collections import defaultdict
+import re
+from collections import Counter, defaultdict
+from dataclasses import dataclass
 
 import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from . import attributes as attributes_module
 from . import learning, planning
 from .db import AuditLog, Prediction, ProfileVersion, ProjectState, Run, Sample, SpecVersion, WebhookEvent
 from .geometry import (
@@ -53,14 +56,173 @@ def save_spec(session: Session, state: ProjectState, document_name: str, parsed:
     return state
 
 
+@dataclass
+class FrameScope:
+    """Which images of a task to annotate. Frame numbers are CVAT's: the first image is 0.
+
+    `start`/`end` give a range (either may be left out), `frames` picks single images, and
+    `only_new` skips images that already carry a shape or track, so images added later are
+    annotated without redrawing the rest.
+    """
+
+    start: int | None = None
+    end: int | None = None
+    frames: set[int] | None = None
+    only_new: bool = False
+
+    @property
+    def is_full(self) -> bool:
+        return self.start is None and self.end is None and self.frames is None and not self.only_new
+
+    def overlaps(self, first: int, last: int) -> bool:
+        if self.frames is not None:
+            return any(first <= frame <= last for frame in self.frames)
+        if self.start is not None and last < self.start:
+            return False
+        return not (self.end is not None and first > self.end)
+
+    def wants(self, frame: int, drawn: set[int]) -> bool:
+        if self.frames is not None and frame not in self.frames:
+            return False
+        if self.start is not None and frame < self.start:
+            return False
+        if self.end is not None and frame > self.end:
+            return False
+        return not (self.only_new and frame in drawn)
+
+    def describe(self) -> str:
+        parts = []
+        if self.frames is not None:
+            parts.append("the selected images")
+        elif self.start is not None or self.end is not None:
+            parts.append(f"frames {self.start if self.start is not None else 0} to {self.end if self.end is not None else 'the last'}")
+        if self.only_new:
+            parts.append("only images without shapes")
+        return ", ".join(parts)
+
+
+def parse_frame_selection(text: str | None) -> set[int] | None:
+    """'0-4, 9, 12-15' becomes {0,1,2,3,4,9,12,13,14,15}. Empty text means no selection."""
+    if text is None or not text.strip():
+        return None
+    chosen: set[int] = set()
+    for token in re.split(r"[,\s;]+", text.strip()):
+        if not token:
+            continue
+        match = re.fullmatch(r"(\d+)(?:\s*[-:]\s*(\d+))?", token)
+        if not match:
+            raise ValueError(f"'{token}' is not a frame number or range")
+        first = int(match.group(1))
+        last = int(match.group(2)) if match.group(2) is not None else first
+        if last < first:
+            raise ValueError(f"The range {token} ends before it starts")
+        if last - first > 100000:
+            raise ValueError(f"The range {token} is too large")
+        chosen.update(range(first, last + 1))
+    return chosen or None
+
+
+def drawn_frames(annotations: dict, start_frame: int | None = None, stop_frame: int | None = None) -> set[int]:
+    """Frames covered by a shape or an interpolated, visible track."""
+    frames = {int(shape.get("frame") or 0) for shape in annotations.get("shapes") or []}
+    for track in annotations.get("tracks") or []:
+        points = sorted(track.get("shapes") or [], key=lambda point: int(point.get("frame") or 0))
+        for index, point in enumerate(points):
+            if point.get("outside"):
+                continue
+            first = int(point.get("frame") or 0)
+            if index + 1 < len(points):
+                next_point = points[index + 1]
+                last = int(next_point.get("frame") or 0) - int(bool(next_point.get("outside")))
+            else:
+                last = stop_frame if stop_frame is not None else first
+            if stop_frame is not None:
+                last = min(last, stop_frame)
+            if start_frame is not None:
+                first = max(first, start_frame)
+            if last >= first:
+                frames.update(range(first, last + 1))
+    return frames
+
+
+CVAT_SOURCE = "cvat_labels"
+CVAT_SUMMARY = (
+    "No requirement document was uploaded. The labels come from this CVAT project, "
+    "and the agent learns how to annotate them from what people draw by hand."
+)
+
+
+def spec_from_cvat_labels(cvat_labels: list[dict]) -> dict:
+    """An implicit requirement made of the labels someone added by hand in CVAT."""
+    labels = []
+    for item in cvat_labels:
+        if item.get("parent_id") or item.get("has_parent") or not item.get("name"):
+            continue
+        attributes = []
+        for attr in item.get("attributes") or []:
+            attributes.append(
+                {
+                    "name": attr.get("name"),
+                    "input_type": attr.get("input_type") or "text",
+                    "default": attr.get("default_value") or "",
+                    "values": list(attr.get("values") or []),
+                    "mutable": bool(attr.get("mutable", True)),
+                }
+            )
+        labels.append(
+            {
+                "name": item["name"],
+                "type": item.get("type") or "any",
+                "attributes": attributes,
+                "detect_as": [],
+                "min_size": None,
+                "how_to_annotate": "",
+                "how_to_decide": "",
+            }
+        )
+    return {
+        "source": CVAT_SOURCE,
+        "output_format": "CVAT",
+        "labels": labels,
+        "questions": [],
+        "guide": {"summary": CVAT_SUMMARY, "decisions": []},
+    }
+
+
+def sync_spec_from_cvat(session: Session, state: ProjectState, cvat_labels: list[dict]) -> bool:
+    """Keep the requirement in step with labels added by hand in CVAT, when no document was uploaded.
+
+    A requirement from an uploaded document is never touched. Returns True when the saved requirement changed.
+    """
+    current = state.spec_json or {}
+    if current.get("labels") and current.get("source") != CVAT_SOURCE:
+        return False
+    built = spec_from_cvat_labels(cvat_labels)
+    if not built["labels"]:
+        return False
+    if current.get("source") == CVAT_SOURCE and [
+        (item["name"], item["type"], [a["name"] for a in item["attributes"]]) for item in current.get("labels") or []
+    ] == [(item["name"], item["type"], [a["name"] for a in item["attributes"]]) for item in built["labels"]]:
+        return False
+    save_spec(session, state, "CVAT project labels", built)
+    return True
+
+
 def _attribute_body(attr: dict, existing_id: int | None = None) -> dict:
+    kind = attr.get("input_type") or "text"
+    raw_default = attr.get("default") or attr.get("default_value") or ""
+    values = [str(item) for item in attr.get("values") or []]
+    # A default CVAT accepts: checkbox is true/false, select and radio pick one of their values.
+    default = attributes_module._default({"input_type": kind, "values": values, "default_value": raw_default})
     body = {
         "name": attr["name"],
-        "mutable": True,
-        "input_type": attr.get("input_type") or "text",
-        "default_value": str(attr.get("default") or attr.get("default_value") or ""),
-        "values": list(attr.get("values") or []),
+        "mutable": bool(attr.get("mutable", True)),
+        "input_type": kind,
+        "default_value": default if default is not None else str(raw_default),
+        "values": values,
     }
+    if kind == "checkbox":
+        body["values"] = [body["default_value"]]
     if existing_id:
         body["id"] = existing_id
     return body
@@ -121,8 +283,8 @@ def label_patch(diff: dict, existing: list[dict], confirm: bool) -> list[dict]:
         payload.append(_label_create_body(label))
     for change in diff["update"]:
         current = existing_by_name[change["name"]]
-        current_attrs = {attr["name"]: attr for attr in current.get("attributes") or []}
-        incoming = {attr["name"]: attr for attr in change.get("attributes") or []}
+        current_attrs = {str(attr.get("name") or "").casefold(): attr for attr in current.get("attributes") or []}
+        incoming = {str(attr.get("name") or "").casefold(): attr for attr in change.get("attributes") or []}
         attributes = []
         for name, attr in current_attrs.items():
             if name in incoming:
@@ -186,6 +348,8 @@ def record_frame(
             Sample.event_key == event_key,
         )
     )
+    if existing is not None:
+        items = learning.keep_hand_drawn(items, list(existing.items_json or []))
     if existing is None:
         session.add(
             Sample(
@@ -957,6 +1121,13 @@ def to_cvat_tracks(
     frame_size: tuple[int, int] | None = None,
 ) -> list[dict]:
     """Native CVAT tracks. Each track keeps the geometry of its shapes, including masks and polygons."""
+    # CVAT keeps an object's fixed attributes on the track and the changing ones on each keyframe.
+    mutable_by_spec = {
+        attr["id"]: bool(attr.get("mutable", True))
+        for item in label_ids.values()
+        for attr in item.get("attributes") or []
+        if attr.get("id") is not None
+    }
     grouped: dict[int, list[dict]] = {}
     for frame in sorted(frames):
         for shape in frames[frame]:
@@ -990,6 +1161,17 @@ def to_cvat_tracks(
         first = shapes[0]
         for shape in keyed:
             shape["label_id"] = first["label_id"]
+            shape["attributes"] = [
+                item for item in shape.get("attributes") or [] if mutable_by_spec.get(item["spec_id"], True)
+            ]
+        fixed: dict[int, Counter] = {}
+        for shape in shapes:
+            for item in shape.get("attributes") or []:
+                if not mutable_by_spec.get(item["spec_id"], True):
+                    fixed.setdefault(item["spec_id"], Counter())[item["value"]] += 1
+        track_attributes = [
+            {"spec_id": spec_id, "value": votes.most_common(1)[0][0]} for spec_id, votes in fixed.items()
+        ]
         tracks.append(
             {
                 "label_id": first["label_id"],
@@ -997,7 +1179,7 @@ def to_cvat_tracks(
                 "group": int(first.get("group") or 0),
                 "source": "auto",
                 "shapes": keyed,
-                "attributes": first.get("attributes") or [],
+                "attributes": track_attributes,
             }
         )
     return tracks
@@ -1067,7 +1249,7 @@ def _track_shape(shape: dict) -> dict:
         "occluded": bool(shape.get("occluded")),
         "outside": bool(shape.get("outside")),
         "z_order": 0,
-        "attributes": [],
+        "attributes": list(shape.get("attributes") or []),
     }
     if shape["type"] in {"rectangle", "ellipse"}:
         payload["rotation"] = float(shape.get("rotation") or 0)
@@ -1165,11 +1347,7 @@ def to_cvat_shape(shape: dict, label_ids: dict[str, dict], frame: int) -> dict |
     label = label_ids.get(shape["label"])
     if label is None:
         return None
-    attributes = []
-    specs = {attr["name"]: attr for attr in label.get("attributes") or []}
-    for name, value in (shape.get("attributes") or {}).items():
-        if name in specs:
-            attributes.append({"spec_id": specs[name]["id"], "value": str(value)})
+    attributes = attributes_module.cvat_attributes(shape.get("attributes"), label.get("attributes") or [])
     payload = {
         "type": shape["type"],
         "frame": frame,

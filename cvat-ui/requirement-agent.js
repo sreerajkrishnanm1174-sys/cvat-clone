@@ -145,7 +145,7 @@
       "#ra-tools .ra-card-head h3{margin:0;font-size:15px;line-height:36px;font-weight:650}",
       "#ra-tools .ra-card-head .ra-btn{width:auto;height:36px;padding:0 12px;white-space:nowrap}",
       "#ra-tools .ra-field{display:flex;flex-direction:column;align-items:stretch;gap:8px;margin-top:4px}",
-      "#ra-tools input[type=text],#ra-tools select{display:block;width:100%;height:40px;box-sizing:border-box;margin:0;border:1px solid #d0d5dd;border-radius:8px;padding:0 12px;font:inherit;background:#fff;color:#1f2430}",
+      "#ra-tools input[type=text],#ra-tools input[type=number],#ra-tools select{display:block;width:100%;height:40px;box-sizing:border-box;margin:0;border:1px solid #d0d5dd;border-radius:8px;padding:0 12px;font:inherit;background:#fff;color:#1f2430}",
       "#ra-tools .ra-file{position:relative;display:flex;align-items:center;width:100%;height:40px;box-sizing:border-box;margin:0;padding:0 12px;border:1px solid #d0d5dd;border-radius:8px;background:#fff;cursor:pointer;overflow:hidden}",
       "#ra-tools .ra-file span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
       "#ra-tools .ra-file input{position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;cursor:pointer}",
@@ -165,6 +165,8 @@
       ".ra-btn.primary{background:#1890ff;border-color:#1890ff;color:#fff}",
       ".ra-btn:disabled{opacity:.55;cursor:default}",
       ".ra-chip{display:inline-block;margin:0 6px 6px 0;padding:2px 8px;border-radius:99px;background:#f5f5f5;font-size:12px}",
+      ".ra-label-item{padding:6px 0;border-bottom:1px solid #f0f0f0}",
+      ".ra-label-attrs{padding:0 8px 4px;color:#667085;font-size:11px;line-height:1.5;overflow-wrap:anywhere}",
       ".ra-status{margin-top:8px;padding:8px 10px;border-radius:8px;background:#f6f8fa;font-size:12px;white-space:pre-wrap}",
       "#ra-log{display:contents}",
       "#ra-dashboard,#ra-task-banner{margin:12px 16px 0;padding:14px 16px;border:1px solid #d6e4ff;border-radius:10px;background:linear-gradient(180deg,#f5f8ff,#fff)}",
@@ -233,7 +235,7 @@
       "<section class='ra-card'><div class='ra-card-head'><h3>Projects</h3><button class='ra-btn' id='ra-new-toggle' type='button'>New project</button></div><p class='ra-muted' id='ra-list-copy'>Loading your projects…</p><div id='ra-project-list'></div><div id='ra-new' class='ra-field' hidden><input id='ra-new-name' type='text' placeholder='Project name' aria-label='Project name'/><label class='ra-file'><span id='ra-new-file-label'>Requirement document</span><input id='ra-new-file' type='file' accept='.pdf,.docx,.txt,.md'/></label><button class='ra-btn primary' id='ra-new-create' type='button'>Create project</button><div class='ra-status' id='ra-new-status' hidden></div></div></section>",
       "<section class='ra-card' id='ra-detail'><div class='ra-card-head'><h3>This project</h3></div><p class='ra-muted' id='ra-project-copy'>Select a project. The agent reads its requirement and explains the tool, the drawing method, and the decision for each label.</p><div id='ra-labels'></div><div id='ra-guide'></div><div id='ra-tasks'></div><p class='ra-muted' id='ra-learning'></p><label class='ra-switch'><input id='ra-learn' type='checkbox'/> Learn from this project's corrections</label></section>",
       "<section class='ra-card'><div class='ra-card-head'><h3>Requirement</h3></div><p class='ra-muted'>Upload the client document. The agent reads it and sets up the labels for this project.</p><div class='ra-actions'><label class='ra-file'><span>Upload requirement</span><input id='ra-file' type='file' accept='.pdf,.docx,.txt,.md'/></label><button class='ra-btn' id='ra-analyze' type='button'>Analyze requirement</button><button class='ra-btn' id='ra-apply' type='button'>Apply labels</button></div><div class='ra-status' id='ra-req-status' hidden></div></section>",
-      "<section class='ra-card'><div class='ra-card-head'><h3>Task in this project</h3></div><p class='ra-muted'>Choose images or one video, then create the task. Auto-annotation starts only after CVAT has imported the file.</p><div class='ra-field'><input id='ra-task-name' type='text' placeholder='Task name' aria-label='Task name'/><label class='ra-file'><span id='ra-task-file-label'>Choose images or a video</span><input id='ra-task-images' type='file' accept='image/*,video/*,.zip,.jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff,.mp4,.mov,.avi,.mkv,.webm,.mpeg,.mpg,.m4v' multiple/></label><p class='ra-muted' id='ra-task-file-note' hidden>No images chosen.</p><button class='ra-btn primary' id='ra-task-create' type='button'>Create task</button><div class='ra-status' id='ra-task-status' hidden></div><select id='ra-task-choose' aria-label='Choose a task'><option value=''>No task selected</option></select><div class='ra-split'><button class='ra-btn primary' id='ra-open-tool' type='button'>Open in tool</button><button class='ra-btn' id='ra-annotate' type='button'>Annotate this task</button><select id='ra-shape' aria-label='Annotation shape'><option value='auto'>Automatic shape</option><option value='rectangle'>Rectangle</option><option value='polygon'>Polygon</option><option value='mask'>Mask</option><option value='polyline'>Polyline</option><option value='points'>Points</option><option value='ellipse'>Ellipse</option><option value='skeleton'>Skeleton</option></select><button class='ra-btn wide' id='ra-sync' type='button'>Learn from my corrections</button></div><p class='ra-muted'>Add keeps the current images. Replace removes them.</p><label class='ra-file'><span id='ra-more-file-label'>Images to add or replace</span><input id='ra-more-images' type='file' accept='image/*,.zip,.jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff' multiple/></label><p class='ra-muted' id='ra-more-note' hidden>No images chosen.</p><div class='ra-split'><button class='ra-btn primary' id='ra-images-add' type='button'>Add to current images</button><button class='ra-btn' id='ra-images-replace' type='button'>Replace current images</button></div></div></section>",
+      "<section class='ra-card'><div class='ra-card-head'><h3>Task in this project</h3></div><p class='ra-muted'>Choose images or one video, then create the task. Auto-annotation starts only after CVAT has imported the file.</p><div class='ra-field'><input id='ra-task-name' type='text' placeholder='Task name' aria-label='Task name'/><label class='ra-file'><span id='ra-task-file-label'>Choose images or a video</span><input id='ra-task-images' type='file' accept='image/*,video/*,.zip,.jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff,.mp4,.mov,.avi,.mkv,.webm,.mpeg,.mpg,.m4v' multiple/></label><p class='ra-muted' id='ra-task-file-note' hidden>No images chosen.</p><button class='ra-btn primary' id='ra-task-create' type='button'>Create task</button><div class='ra-status' id='ra-task-status' hidden></div><select id='ra-task-choose' aria-label='Choose a task'><option value=''>No task selected</option></select><p class='ra-muted'>Annotate only some images. The first image is 0. Leave empty to annotate the whole task.</p><div class='ra-split'><input id='ra-start-frame' type='number' min='0' placeholder='Start frame' aria-label='Start frame'/><input id='ra-end-frame' type='number' min='0' placeholder='End frame' aria-label='End frame'/></div><input id='ra-frames' type='text' placeholder='Or pick images: 0-4, 9, 12-15' aria-label='Pick images'/><label class='ra-switch'><input id='ra-only-new' type='checkbox'/> Only images without shapes (new images)</label><div class='ra-split'><button class='ra-btn primary' id='ra-open-tool' type='button'>Open in tool</button><button class='ra-btn' id='ra-annotate' type='button'>Annotate this task</button><select id='ra-shape' aria-label='Annotation shape'><option value='auto'>Automatic shape</option><option value='rectangle'>Rectangle</option><option value='polygon'>Polygon</option><option value='mask'>Mask</option><option value='polyline'>Polyline</option><option value='points'>Points</option><option value='ellipse'>Ellipse</option><option value='skeleton'>Skeleton</option></select><button class='ra-btn wide' id='ra-sync' type='button'>Learn from my corrections</button></div><p class='ra-muted'>Add keeps the current images. Replace removes them.</p><label class='ra-file'><span id='ra-more-file-label'>Images to add or replace</span><input id='ra-more-images' type='file' accept='image/*,.zip,.jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff' multiple/></label><p class='ra-muted' id='ra-more-note' hidden>No images chosen.</p><div class='ra-split'><button class='ra-btn primary' id='ra-images-add' type='button'>Add to current images</button><button class='ra-btn' id='ra-images-replace' type='button'>Replace current images</button></div></div></section>",
       "</div></div>",
     ].join("");
     document.body.appendChild(panel);
@@ -425,10 +427,46 @@
     var title = view.projectName ? view.projectName + " · project " + view.projectId : "Project " + view.projectId;
     if (view.taskId) title += " · task " + view.taskId + (view.taskName ? " " + view.taskName : "");
     copy.textContent = title;
-    var items = ((spec && spec.spec && spec.spec.labels) || []);
+    var savedItems = ((spec && spec.spec && spec.spec.labels) || []);
+    var currentLabels = (spec && spec.cvat_labels) || [];
+    var currentByName = Object.create(null);
+    currentLabels.forEach(function (item) {
+      if (item && item.name && !item.parent_id && !item.has_parent) currentByName[item.name] = item;
+    });
+    var seenNames = Object.create(null);
+    var items = savedItems.map(function (item) {
+      var current = currentByName[item.name];
+      seenNames[item.name] = true;
+      return current ? Object.assign({}, item, {
+        type: current.type || item.type,
+        attributes: current.attributes || item.attributes || [],
+      }) : item;
+    });
+    currentLabels.forEach(function (item) {
+      if (item && item.name && !item.parent_id && !item.has_parent && !seenNames[item.name]) {
+        items.push(item);
+        seenNames[item.name] = true;
+      }
+    });
     labels.innerHTML = items.length
       ? items.map(function (item) {
-        return "<span class='ra-chip'>" + item.name + " · " + (item.type || "any") + "</span>";
+        var attributes = (item.attributes || []).filter(function (attribute) { return attribute && attribute.name; });
+        var attributeHtml = attributes.length
+          ? "<div class='ra-label-attrs'><b>Attributes</b><br>" + attributes.map(function (attribute) {
+            var kind = attribute.input_type || attribute.type || "text";
+            var values = Array.isArray(attribute.values) && attribute.values.length
+              ? " · " + attribute.values.map(function (value) { return escapeHtml(value); }).join(", ")
+              : "";
+            var defaultValue = attribute.default !== undefined && attribute.default !== null && String(attribute.default) !== ""
+              ? attribute.default
+              : attribute.default_value;
+            var defaultText = defaultValue !== undefined && defaultValue !== null && String(defaultValue) !== ""
+              ? " · default: " + escapeHtml(defaultValue)
+              : "";
+            return "<div>" + escapeHtml(attribute.name) + " · " + escapeHtml(kind) + values + defaultText + "</div>";
+          }).join("") + "</div>"
+          : "";
+        return "<div class='ra-label-item'><span class='ra-chip'>" + escapeHtml(item.name) + " · " + escapeHtml(item.type || "any") + "</span>" + attributeHtml + "</div>";
       }).join("")
       : "<span class='ra-muted'>No requirement document is saved for this project yet.</span>";
     learningNode.textContent = learning
@@ -703,9 +741,13 @@
     analyzer("/projects/" + view.projectId + "/requirements", { method: "POST", body: body }).then(function (result) {
       var labels = (result.spec && result.spec.labels) || [];
       var names = labels.map(function (item) { return item.name + " (" + (item.type || "any") + ")"; }).join(", ");
+      var warning = result.spec && result.spec.extraction_warning;
       setStatus("ra-req-status", labels.length
-        ? "The project is set up from the requirement. " + labels.length + " label(s) applied: " + names + "."
-        : "The document was read, but it did not describe any annotation class. Analyze requirement if the skeleton properties were not picked up.");
+        ? (warning ? "Detected " : "The project is set up from the requirement. ") + labels.length + " label(s): " + names + "."
+          + (warning ? " Requirement analysis needs attention: " + warning : "")
+        : warning
+          ? "The document text was read, but requirement analysis failed: " + warning
+          : "The document was read, but it did not describe any annotation class. Analyze requirement if the skeleton properties were not picked up.");
       return refresh();
     }).catch(function (error) { setStatus("ra-req-status", error.message); });
   }
@@ -965,7 +1007,7 @@
       if (!currentCount) {
         setStatus("ra-task-status", "This task has no images yet. Uploading " + incoming.length + " file(s)…");
         return uploadTaskImages(oldId, incoming).then(function (updated) {
-          return { task: updated, removed: false };
+          return { task: updated, removed: false, addedFrom: adding ? currentCount : null };
         });
       }
       var savedAnnotations = null;
@@ -1000,7 +1042,7 @@
           setStatus("ra-task-status", "Removing the previous copy of this task…");
           return deleteCvatTask(oldId).then(function () {
             committed = true;
-            return { task: updated, removed: true, previousId: oldId };
+            return { task: updated, removed: true, previousId: oldId, addedFrom: adding ? currentCount : null };
           });
         });
       });
@@ -1021,7 +1063,12 @@
       }
       return refresh().then(function () {
         chooseTask(done.task.id, view.taskName, true);
-        setStatus("ra-task-status", note + " Press Annotate this task when you want the agent to draw the new images.");
+        var added = done.addedFrom != null ? done.task.size - done.addedFrom : 0;
+        if (adding && added > 0 && window.confirm(note + " Auto-annotate only the " + added + " new image(s) now? The images already there stay as they are.")) {
+          view.taskId = done.task.id;
+          return annotateRange({ start_frame: done.addedFrom, only_new: true }, note);
+        }
+        setStatus("ra-task-status", note + " Press Annotate this task when you want the agent to draw the new images. Tip: tick Only images without shapes first.");
         if (done.removed && location.pathname.indexOf("/tasks/" + done.previousId) !== -1) openTaskInTool();
       });
     }).catch(function (error) {
@@ -1127,6 +1174,46 @@
       }).catch(function (error) { setStatus("ra-req-status", error.message); });
   }
 
+  function frameScope() {
+    function read(id) {
+      var node = document.getElementById(id);
+      return node ? String(node.value || "").trim() : "";
+    }
+    var scope = {};
+    var start = read("ra-start-frame");
+    var end = read("ra-end-frame");
+    var picked = read("ra-frames");
+    var onlyNew = document.getElementById("ra-only-new");
+    if (start !== "") scope.start_frame = Number(start);
+    if (end !== "") scope.end_frame = Number(end);
+    if (picked) scope.frames = picked;
+    if (onlyNew && onlyNew.checked) scope.only_new = true;
+    if ((scope.start_frame != null && !(scope.start_frame >= 0)) || (scope.end_frame != null && !(scope.end_frame >= 0))) {
+      throw new Error("Frame numbers start at 0.");
+    }
+    if (scope.start_frame != null && scope.end_frame != null && scope.end_frame < scope.start_frame) {
+      throw new Error("The end frame is before the start frame.");
+    }
+    return scope;
+  }
+
+  function annotateRange(scope, note) {
+    if (!view.projectId || !view.taskId) return Promise.resolve();
+    var finishClock = beginAnnotateClock(note + " Annotating only the new images.");
+    return analyzer("/projects/" + view.projectId + "/annotate", {
+      method: "POST",
+      json: Object.assign({
+        task_id: view.taskId,
+        mode: "auto_first",
+        shape: (document.getElementById("ra-shape") || {}).value || "auto",
+      }, scope),
+    }).then(function (result) {
+      finishClock((result && result.message) || "Annotation finished.");
+    }, function (error) {
+      finishClock(error.message || "Annotation failed.");
+    }).then(refresh);
+  }
+
   function onAnnotate() {
     if (!view.projectId || !view.taskId) {
       setStatus("ra-task-status", "Open a task that belongs to a project, then annotate it.");
@@ -1134,13 +1221,21 @@
     }
     var button = document.getElementById("ra-annotate");
     button.disabled = true;
+    var scope;
+    try {
+      scope = frameScope();
+    } catch (error) {
+      setStatus("ra-task-status", error.message);
+      button.disabled = false;
+      return;
+    }
     setStatus("ra-task-status", "Checking that the images are in the task…");
     cvat("/api/tasks/" + view.taskId).then(function (task) {
       if (!task.size) throw new Error("This task has no images. Choose the image files, create the task, and wait until the import finishes.");
       var finishClock = beginAnnotateClock("Looking at " + task.size + " image(s). Correct the shapes in Standard when it finishes.");
       return analyzer("/projects/" + view.projectId + "/annotate", {
         method: "POST",
-        json: { task_id: view.taskId, mode: "auto_first", shape: (document.getElementById("ra-shape") || {}).value || "auto" },
+        json: Object.assign({ task_id: view.taskId, mode: "auto_first", shape: (document.getElementById("ra-shape") || {}).value || "auto" }, scope),
       }).then(function (result) {
         finishClock((result && result.message) || "Annotation finished.");
       }, function (error) {

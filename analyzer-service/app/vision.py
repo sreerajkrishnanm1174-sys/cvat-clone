@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 
 import httpx
 
+from . import accuracy
 from .geometry import outline_is_template, simplify_polygon
 
 FALLBACK_MODELS = (
@@ -43,10 +45,18 @@ class VisionError(RuntimeError):
 
 
 CLAUDE_SYSTEM = """You are an annotation agent. You get one image, a list of labels with annotation
-rules, and general guidelines. Find every object that matches a label and return ONLY JSON:
+rules, and general guidelines. Small reference crops may come first, each with a caption saying which
+label the annotator drew. The LAST image in the message is the only one to annotate; coordinates belong
+to it alone. Find every object that matches a label and return ONLY JSON:
 {"objects":[{"label":"<exact label name>","bbox":[x1,y1,x2,y2],"polygon":[[x,y],...],
 "keypoints":[{"name":"<keypoint name>","x":0,"y":0,"v":2}],"score":0.0-1.0,"attributes":{}}]}
 Coordinates are pixels in the image you were given (origin top-left).
+Each label may list attributes. For every object, fill every attribute of its label in "attributes",
+as {"<attribute name>": "<value>"}. Judge each value from what you can see. checkbox: "true" or "false".
+select and radio: exactly one of the listed values. number: a number between min and max. text: a short
+phrase. If you cannot tell from the image, use the attribute's default. Never invent an attribute name.
+"attribute_habits" says what the annotators in this project chose before. The reference crops show what each chosen
+value looks like. Follow what the image shows. Only when it does not show the value, use the usual choice.
 By label annotation_type:
 - bounding_box: bbox only.
 - polygon and mask: bbox only. Tight box around the visible object. The silhouette is traced from the
@@ -104,10 +114,11 @@ def build_prompt(labels: list[dict], lessons: list[str], width: int, height: int
         if label.get("min_size"):
             item["min_size_px"] = label["min_size"]
         if label.get("attributes"):
-            item["attributes"] = [
-                {"name": attr.get("name"), "values": attr.get("values") or []}
-                for attr in label["attributes"]
-            ]
+            from .attributes import describe
+
+            item["attributes"] = [describe(attr) for attr in label["attributes"]]
+            if label.get("learned_attributes"):
+                item["attribute_habits"] = label["learned_attributes"]
         if label.get("how_to_annotate"):
             item["how_to_annotate"] = label["how_to_annotate"]
         if label.get("how_to_decide"):
@@ -210,6 +221,7 @@ def annotate_image(
     labels: list[dict],
     lessons: list[str],
     refine: bool = True,
+    exemplars: list[dict] | None = None,
 ) -> list[dict]:
     from .detect import as_detection_box, dedupe_shapes, detector_shapes, labels_needing_vision
 
@@ -224,9 +236,18 @@ def annotate_image(
         if not api_key and not detected:
             raise VisionError("No vision API key is configured.")
         if api_key:
-            vision = _ask_vision(api_key, model, image, pending, lessons, refine=False)
+            vision = _ask_vision(api_key, model, image, pending, lessons, refine=False, exemplars=exemplars)
+            tuning = _accuracy_settings()
+            if tuning["tiling"]:
+                vision = vision + accuracy.detect_tiled(
+                    image,
+                    lambda tile: _ask_vision(api_key, model, tile, pending, lessons, refine=False, exemplars=exemplars),
+                    tuning["tile_min_side"],
+                )
             if refine:
                 vision = [as_detection_box(shape) for shape in vision]
+            if tuning["verify"]:
+                vision = accuracy.verify_boxes(image, vision, pending, _make_ask(api_key, model))
     shapes = dedupe_shapes(detected + vision)
     if not refine or not shapes:
         return shapes
@@ -257,6 +278,53 @@ def annotate_image(
     return dedupe_shapes(traced)
 
 
+def _accuracy_settings() -> dict:
+    try:
+        from .config import get_settings
+
+        settings = get_settings()
+        return {
+            "tiling": bool(settings.annotation_tiling),
+            "tile_min_side": int(settings.annotation_tile_min_side),
+            "verify": bool(settings.annotation_verify),
+        }
+    except Exception:
+        return {"tiling": True, "tile_min_side": 2000, "verify": True}
+
+
+def _make_ask(api_key: str, model: str):
+    """ask(system, content) -> text, trying the configured model and then the fallbacks."""
+    state = {"name": None}
+
+    def ask(system: str, content: list) -> str:
+        names = [state["name"]] if state["name"] else []
+        for name in (model, *FALLBACK_MODELS):
+            if name and name not in names:
+                names.append(name)
+        last = "The vision model did not respond."
+        for name in names:
+            reply = httpx.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={"model": name, "max_tokens": 3000, "system": system, "messages": [{"role": "user", "content": content}]},
+                timeout=120,
+            )
+            if reply.status_code == 404 or _vision_model_missing(reply):
+                last = f"The vision model {name} is not available."
+                continue
+            if reply.status_code >= 400:
+                raise VisionError(_vision_error_text(reply) or f"The vision model returned HTTP {reply.status_code}.")
+            state["name"] = name
+            return "".join(b.get("text") or "" for b in reply.json().get("content") or [] if b.get("type") == "text")
+        raise VisionError(last)
+
+    return ask
+
+
 def log_detect(exc: Exception) -> None:
     import logging
 
@@ -270,24 +338,22 @@ def _ask_vision(
     labels: list[dict],
     lessons: list[str],
     refine: bool = True,
+    exemplars: list[dict] | None = None,
 ) -> list[dict]:
     payload, media_type, scale, width, height = prepare_image(image)
     prompt = build_prompt(labels, lessons, width, height)
     import base64
 
     encoded = base64.b64encode(payload).decode("ascii")
+    content = _example_blocks(exemplars, {item.get("name") for item in labels})
+    content += [
+        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": encoded}},
+        {"type": "text", "text": prompt},
+    ]
     body = {
         "max_tokens": 6000,
         "system": CLAUDE_SYSTEM,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": encoded}},
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ],
+        "messages": [{"role": "user", "content": content}],
     }
     models = []
     for name in (model, *FALLBACK_MODELS):
@@ -339,6 +405,41 @@ def _ask_vision(
             shapes = refine_shapes(image, shapes, labels, ask)
         return shapes
     raise VisionError(last_error)
+
+
+def _example_blocks(exemplars: list[dict] | None, label_names: set) -> list[dict]:
+    """Crops of what this project's annotators drew, placed before the image to annotate."""
+    import base64
+
+    from .labelmemory import exemplar_caption
+
+    usable = [item for item in exemplars or [] if item.get("crop") and item.get("label") in label_names]
+    if not usable:
+        return []
+    blocks: list[dict] = [
+        {
+            "type": "text",
+            "text": (
+                "Reference examples follow. Annotators in this project drew each of these objects by hand. "
+                "Use them to learn what each label means here and how they draw it. "
+                "They are not part of the image to annotate, so never output coordinates for them."
+            ),
+        }
+    ]
+    for item in usable:
+        blocks.append({"type": "text", "text": exemplar_caption(item)})
+        blocks.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": base64.b64encode(item["crop"]).decode("ascii"),
+                },
+            }
+        )
+    blocks.append({"type": "text", "text": "Now annotate the following image."})
+    return blocks
 
 
 def _scaled_point(x: float, y: float, scale: float, width: int, height: int) -> tuple[float, float]:
@@ -500,26 +601,70 @@ def _score(item: dict) -> float:
 
 GUIDE_SYSTEM = """You read an annotation requirement and decide the CVAT labels for the project.
 Return ONLY JSON:
-{"summary":"","workflow":"","tracking":false,"decisions":[{"name":"","type":"rectangle|polygon|polyline|points|ellipse|cuboid|mask|skeleton|tag|interval","why_this_type":"","how_to_annotate":"","how_to_decide":"","attributes":"","keypoints":[],"edges":[["joint","joint"]]}]}
+{"summary":"","workflow":"","tracking":false,"decisions":[{"name":"","type":"rectangle|polygon|polyline|points|ellipse|cuboid|mask|skeleton|tag|interval","why_this_type":"","how_to_annotate":"","how_to_decide":"","attributes":[{"name":"","input_type":"select|radio|checkbox|number|text","values":[],"default":"","mutable":true}],"keypoints":[],"edges":[["joint","joint"]]}]}
 A document does not have to use a Label: heading. Read skeleton properties, joint lists, and connections as one skeleton label.
 keypoints are the joint names in the document's order. edges are only the connections the document names, as pairs of those names.
 Do not connect a joint to the next name in the list unless the document connects them.
 Create one decision for every class the document describes. Do not invent a class that is not described.
 If labels were already read, keep them and add only classes the document still describes.
+When existing CVAT project labels are supplied, map requirement classes to those exact names only when the document clearly refers to them. Do not create duplicate aliases. If mapping is unclear, do not guess.
 Set tracking true when objects must keep the same id across frames.
+attributes: inspect all supplied text and every attached page/image, including tables, screenshots, scans, diagrams,
+captions, and notes. List every attribute the document asks for on that class, also when it is only described in a sentence
+(for example "record the colour of each mirror" is an attribute named colour). Use select or radio with values when the
+document lists the choices, checkbox for yes/no, number for a measure (values are [min, max, step]), and text for free entry.
+Copy specified defaults and values exactly. Leave defaults empty when none is specified. Do not infer a value or attribute.
+mutable is false when the value stays the same for the whole object on a video. Do not invent an attribute the document does not ask for.
 """
 
 
-def analyze_requirement(api_key: str, model: str, text: str, parsed: dict) -> dict:
-    """Ask the model how each label should be drawn. Fall back to the requirement text itself."""
+def analyze_requirement(
+    api_key: str,
+    model: str,
+    text: str,
+    parsed: dict,
+    images: list[dict] | None = None,
+    existing_labels: list[dict] | None = None,
+) -> dict:
+    """Extract label rules from all document text and embedded visual requirement pages."""
     from .spec import explain_requirement
 
     local = explain_requirement(parsed)
     if not api_key:
+        if text or images:
+            local["extraction_warning"] = "Visual requirement analysis was skipped because no vision API key is configured."
         return local
-    excerpt = (text or "").strip()[:12000]
-    if not excerpt and not parsed.get("labels"):
+    document_text = (text or "").strip()
+    if not document_text and not images and not parsed.get("labels"):
         return local
+    content = [{
+        "type": "text",
+        "text": "Labels already read from the document:\n"
+        + json.dumps(local["decisions"], indent=1)
+        + "\n\nExisting CVAT project labels (use these exact names for matching classes; do not create aliases):\n"
+        + json.dumps([
+            {"name": item.get("name"), "type": item.get("type"), "attributes": [
+                {"name": attr.get("name"), "input_type": attr.get("input_type"), "values": attr.get("values"),
+                 "default_value": attr.get("default_value")}
+                for attr in item.get("attributes") or []
+            ]}
+            for item in existing_labels or []
+            if item.get("name") and not item.get("parent_id") and not item.get("has_parent")
+        ], indent=1)
+        + "\n\nComplete requirement text (read every section):\n"
+        + (document_text or "(no selectable text; inspect the attached pages/images)"),
+    }]
+    for image in images or []:
+        raw = image.get("data") or b""
+        if raw:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image.get("media_type") or "image/jpeg",
+                    "data": base64.b64encode(raw).decode("ascii"),
+                },
+            })
     response = httpx.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -531,29 +676,50 @@ def analyze_requirement(api_key: str, model: str, text: str, parsed: dict) -> di
             "model": model or FALLBACK_MODELS[0],
             "max_tokens": 2500,
             "system": GUIDE_SYSTEM,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "Labels already read from the document:\n"
-                    + json.dumps(local["decisions"], indent=1)
-                    + "\n\nRequirement:\n"
-                    + (excerpt or "(the document text is not available)"),
-                }
-            ],
+            "messages": [{"role": "user", "content": content}],
         },
         timeout=90,
     )
     if response.status_code >= 400:
-        return local
+        message = " ".join((response.text or "").split())[:800]
+        raise VisionError(f"Requirement analysis returned HTTP {response.status_code}: {message}")
     raw = "".join(
         block.get("text") or ""
         for block in response.json().get("content") or []
         if block.get("type") == "text"
     )
     data = _load_json(raw)
-    merged = _merge_decisions(local.get("decisions") or [], data.get("decisions") or [])
-    if not merged:
+    decisions = data.get("decisions")
+    if not isinstance(decisions, list):
+        # Accept a direct list/object response as a recoverable model format
+        # variation; the document is data, and all labels still pass normal type
+        # validation in spec.apply_guide before they can be applied.
+        decisions = data.get("labels") if isinstance(data.get("labels"), list) else []
+    cleaned = []
+    for decision in decisions:
+        if not isinstance(decision, dict) or not str(decision.get("name") or "").strip():
+            continue
+        normalized = dict(decision)
+        raw_type = str(normalized.get("type") or normalized.get("annotation_type") or "").strip().lower()
+        normalized["type"] = {
+            "bounding_box": "rectangle", "bounding box": "rectangle", "bbox": "rectangle",
+            "box": "rectangle", "2d bounding box": "rectangle",
+        }.get(raw_type, raw_type)
+        if not isinstance(normalized.get("attributes"), list):
+            normalized["attributes"] = []
+        cleaned.append(normalized)
+    if not cleaned and local.get("decisions"):
+        local["extraction_warning"] = "The requirement guide response had no usable label decisions; using locally extracted document data."
         return local
+    merged = _merge_decisions(local.get("decisions") or [], cleaned)
+    if not merged:
+        # Keep deterministic document parsing results when the guide response is
+        # malformed or incomplete; expose the cause to the UI rather than erasing
+        # the locally recovered labels and attributes.
+        if local.get("decisions"):
+            local["extraction_warning"] = "The requirement guide response had no usable label decisions; using locally extracted document data."
+            return local
+        raise VisionError("Requirement analysis returned no usable label decisions.")
     data["decisions"] = merged
     data.setdefault("summary", local["summary"])
     data.setdefault("workflow", local["workflow"])
@@ -572,7 +738,13 @@ def _merge_decisions(local: list, found: list) -> list:
         name = str(item["name"]).strip()
         base = by_name.get(name, {"name": name, "keypoints": []})
         for key, value in item.items():
-            if value not in (None, "", []):
+            if key == "attributes" and isinstance(value, list):
+                # keep the attributes already read from the document, and add the ones described in words
+                seen = {str(a.get("name") or "").casefold() for a in base.get("attributes") or [] if isinstance(a, dict)}
+                base["attributes"] = [a for a in base.get("attributes") or [] if isinstance(a, dict)] + [
+                    a for a in value if isinstance(a, dict) and str(a.get("name") or "").casefold() not in seen
+                ]
+            elif value not in (None, "", []):
                 base[key] = value
         base["name"] = name
         if not isinstance(base.get("keypoints"), list):

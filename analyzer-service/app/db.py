@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, Integer, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import JSON, Boolean, DateTime, Integer, LargeBinary, String, Text, UniqueConstraint, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -118,6 +118,35 @@ class ClientFormat(Base):
     profile_json: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class LabelExemplar(Base):
+    """A crop of one object a person drew, kept so the agent can learn what a label looks like."""
+
+    __tablename__ = "label_exemplars"
+    __table_args__ = (
+        UniqueConstraint("cvat_project_id", "job_id", "frame", "shape_key", name="uq_label_exemplar"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cvat_project_id: Mapped[int] = mapped_column(Integer, index=True)
+    label: Mapped[str] = mapped_column(String(128), index=True)
+    task_id: Mapped[int] = mapped_column(Integer, default=0)
+    job_id: Mapped[int] = mapped_column(Integer)
+    frame: Mapped[int] = mapped_column(Integer)
+    shape_key: Mapped[str] = mapped_column(String(96))
+    shape_type: Mapped[str] = mapped_column(String(32), default="rectangle")
+    role: Mapped[str] = mapped_column(String(16), default="human")
+    points_json: Mapped[list] = mapped_column(JSON, default=list)
+    attributes_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    box_json: Mapped[list] = mapped_column(JSON, default=list)
+    signature: Mapped[str] = mapped_column(Text, default="")
+    image_w: Mapped[int] = mapped_column(Integer, default=0)
+    image_h: Mapped[int] = mapped_column(Integer, default=0)
+    crop: Mapped[bytes] = mapped_column(LargeBinary)
+    crop_w: Mapped[int] = mapped_column(Integer, default=0)
+    crop_h: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class AuditLog(Base):

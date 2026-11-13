@@ -84,6 +84,38 @@ def shapes_from_items(items: list[dict]) -> list[dict]:
     return shapes
 
 
+def keep_hand_drawn(items: list[dict], previous: list[dict]) -> list[dict]:
+    """Keep what a person drew by hand across later reads of the same frame.
+
+    The last saved shapes are the baseline for spotting edits. A hand-drawn shape that
+    has not changed since would then look like an untouched agent shape, and deleting
+    one would look like rejecting an agent prediction. Neither is true: the agent never
+    drew them. So an unchanged hand drawing stays a human sample, and a deleted one is dropped.
+    """
+    own = [item for item in previous or [] if item.get("role") == "human" and item.get("human")]
+    if not own:
+        return items
+
+    def same_drawing(agent: dict | None, human_item: dict) -> bool:
+        if not agent:
+            return False
+        mine = human_item["human"]
+        if agent.get("id") is not None and mine.get("id") is not None and agent.get("id") != mine.get("id"):
+            return False
+        return not shape_changed(agent, mine)
+
+    kept: list[dict] = []
+    for item in items:
+        origin = next((mine for mine in own if same_drawing(item.get("agent"), mine)), None)
+        if origin is not None and item.get("role") == "untouched":
+            kept.append(origin)
+        elif origin is not None and item.get("role") == "deleted":
+            continue
+        else:
+            kept.append(item)
+    return kept
+
+
 def classify_frame(snapshot: list[dict], final: list[dict]) -> list[dict]:
     """Split a finished frame into human, correction, untouched, or imported samples.
 

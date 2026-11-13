@@ -36,6 +36,7 @@ services:
     ports:
       - "${CVAT_BIND:-0.0.0.0}:8095:8090"
     volumes:
+      - ./app:/app/app:ro
       - analyzer_data:/data
       - /var/run/docker.sock:/var/run/docker.sock:ro
     depends_on:
@@ -61,6 +62,8 @@ services:
       DATABASE_URL: postgresql+psycopg://analyzer:analyzer@analyzer_db:5432/analyzer
       REDIS_URL: redis://analyzer_redis:6379/0
       CVAT_BASE_URL: http://cvat-server:8080
+    volumes:
+      - ./app:/app/app:ro
     depends_on:
       - analyzer
       - analyzer_redis

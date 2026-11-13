@@ -82,6 +82,50 @@ def extra_label_deletions(spec: dict | None, existing: list[dict]) -> list[dict]
 def project_report(client, project_id: int, spec: dict | None) -> dict:
     parsed = spec or {}
     labels = client.get_labels(project_id)
+    requirement_by_name = {
+        item.get("name"): item for item in parsed.get("labels") or [] if item.get("name")
+    }
+    recorded = parsed.get("_configuration_status") or {}
+    recorded_labels = recorded.get("labels") or {}
+    configurations = []
+    for label in labels:
+        if label.get("parent_id") or label.get("has_parent"):
+            continue
+        name = label.get("name") or ""
+        required = requirement_by_name.get(name)
+        old_status = recorded_labels.get(name) or {}
+        current_attrs = {item.get("name"): item for item in label.get("attributes") or []}
+        required_attrs = {item.get("name"): item for item in (required or {}).get("attributes") or []}
+        attribute_rows = []
+        for attr in label.get("attributes") or []:
+            attr_name = attr.get("name") or ""
+            requirement_attr = required_attrs.get(attr_name)
+            status = (old_status.get("attributes") or {}).get(attr_name, "unchanged")
+            attr_type = attr.get("input_type") or "text"
+            attribute_rows.append({
+                "name": attr_name,
+                "type": attr_type,
+                "values": ["true", "false"] if attr_type == "checkbox" else list(attr.get("values") or []),
+                "default": attr.get("default_value") or "",
+                "status": status,
+                "required_by_document": requirement_attr is not None,
+            })
+        for attr_name, requirement_attr in required_attrs.items():
+            if attr_name not in current_attrs:
+                attribute_rows.append({
+                    "name": attr_name,
+                    "type": requirement_attr.get("input_type") or "text",
+                    "values": list(requirement_attr.get("values") or []),
+                    "default": requirement_attr.get("default") or "",
+                    "status": "missing",
+                    "required_by_document": True,
+                })
+        configurations.append({
+            "label": name,
+            "type": label.get("type"),
+            "status": old_status.get("status", "unchanged"),
+            "attributes": attribute_rows,
+        })
     top_labels = [
         {"id": item.get("id"), "name": item.get("name"), "type": item.get("type")}
         for item in labels
@@ -111,7 +155,11 @@ def project_report(client, project_id: int, spec: dict | None) -> dict:
             for item in parsed.get("labels") or []
             if item.get("name")
         ],
+        "missing_requirement_labels": sorted(
+            set(requirement_by_name) - {item.get("name") for item in labels}
+        ),
         "cvat_labels": top_labels,
+        "attribute_configuration": configurations,
         "extra_labels": [item["name"] for item in extra_label_deletions(parsed, labels) if not _child_name(item, labels)],
         "annotations": annotations,
     }

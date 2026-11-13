@@ -30,7 +30,7 @@ class CvatClient:
     def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         response = self._client.request(method, path, **kwargs)
         if response.status_code >= 400:
-            raise CvatError(response.status_code, response.text[:500])
+            raise CvatError(response.status_code, response.text)
         return response
 
     def list_projects(self) -> list[dict]:
@@ -106,6 +106,12 @@ class CvatClient:
 
     def get_labels(self, project_id: int) -> list[dict]:
         response = self._request("GET", "/api/labels", params={"project_id": project_id, "page_size": 1000})
+        data = response.json()
+        return data.get("results", data if isinstance(data, list) else [])
+
+    def get_task_labels(self, task_id: int) -> list[dict]:
+        """Labels that belong to one task. A task outside any project keeps its own labels."""
+        response = self._request("GET", "/api/labels", params={"task_id": task_id, "page_size": 1000})
         data = response.json()
         return data.get("results", data if isinstance(data, list) else [])
 

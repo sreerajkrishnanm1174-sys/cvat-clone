@@ -1,7 +1,7 @@
 from celery import Celery
 
 from .config import get_settings
-from .main import learn_finished_jobs
+from .main import auto_annotate_new_tasks, learn_finished_jobs
 from .cvat import CvatClient
 from .db import init_db, make_engine, make_session_factory
 from .service import get_project
@@ -30,7 +30,9 @@ def sync_all() -> int:
         for state in session.query(ProjectState).all():
             if not state.learn_enabled:
                 continue
-            total += learn_finished_jobs(session, client, get_project(session, state.cvat_project_id), settings)
+            current = get_project(session, state.cvat_project_id)
+            total += learn_finished_jobs(session, client, current, settings)
+            auto_annotate_new_tasks(session, client, current, settings)
         session.commit()
         return total
     finally:

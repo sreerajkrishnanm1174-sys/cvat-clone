@@ -30,6 +30,10 @@
   <button data-mode="auto_first">The agent annotates first</button>
   <button data-mode="mixed">Mix both</button>
   <label>Task id for automatic annotation <input id="task" type="number" /></label>
+  <label>Start frame <input id="startFrame" type="number" min="0" placeholder="first" /></label>
+  <label>End frame <input id="endFrame" type="number" min="0" placeholder="last" /></label>
+  <label>Or pick images <input id="frames" type="text" placeholder="0-4, 9, 12-15" /></label>
+  <label><input id="onlyNew" type="checkbox" /> Only images without shapes (use after adding images)</label>
   <button id="annotate">Auto-annotate this task</button>
   <p>After the requirement is applied, the agent looks at each image in the task and draws the labels itself. CVAT's YOLO and SAM models are not used. Edit the shapes in CVAT, then click Learn from my corrections. The next task follows those edits. Open the job in Standard.</p>
   <button id="sync">Learn from my corrections</button>
@@ -129,7 +133,14 @@
       show("Annotating the task. This can take a few minutes.");
       const result = await call("/projects/" + project.value + "/annotate", {
         method: "POST", headers: headers(true),
-        body: JSON.stringify({ task_id: taskId, mode: "auto_first" })
+        body: JSON.stringify({
+          task_id: taskId,
+          mode: "auto_first",
+          start_frame: document.getElementById("startFrame").value === "" ? null : Number(document.getElementById("startFrame").value),
+          end_frame: document.getElementById("endFrame").value === "" ? null : Number(document.getElementById("endFrame").value),
+          frames: document.getElementById("frames").value.trim() || null,
+          only_new: document.getElementById("onlyNew").checked
+        })
       });
       show(result.message || result.status);
     });

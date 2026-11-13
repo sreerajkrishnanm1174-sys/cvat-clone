@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     analyzer_data_dir: str = "./data"
     annotation_refine: bool = True
+    # Scan large images again in overlapping full-resolution tiles. Helps small objects.
+    annotation_tiling: bool = True
+    annotation_tile_min_side: int = 2000
+    # Re-check every detected box on a zoomed crop: tightens it and drops false positives.
+    annotation_verify: bool = True
     analyzer_root_path: str = ""
     analyzer_webhook_url: str = ""
     # How close a detection must be to keep an existing track id.

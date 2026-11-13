@@ -3,12 +3,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import re
 import secrets
 from pathlib import Path
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
@@ -21,6 +22,7 @@ from .cvat import CvatClient, CvatError
 from .db import ClientFormat, Prediction, Run, Sample, init_db, make_engine, make_session_factory
 from .learning import MODE_TEXT, correction_summary, explain_profile, explain_rule, prompt_lessons, shapes_from_items
 from . import exporting, planning, report, service, spec
+from . import labelmemory
 from .vision import annotate_image
 from . import chat as agent_chat
 from . import custom_format
@@ -47,6 +49,10 @@ class AnnotateIn(BaseModel):
     task_id: int
     mode: str | None = None
     shape: str | None = None
+    start_frame: int | None = None
+    end_frame: int | None = None
+    frames: str | None = None  # single images or ranges, e.g. "0-4, 9, 12-15"
+    only_new: bool = False  # skip images that already have shapes, so added images are annotated alone
 
 
 class CustomExportIn(BaseModel):
@@ -117,7 +123,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             project = client.get_project(project_id)
         except CvatError as exc:
             raise HTTPException(status_code=exc.status, detail="CVAT refused this project") from exc
-        return project, get_project(session, project_id, organization)
+        state = get_project(session, project_id, organization)
+        try:  # labels added by hand in CVAT become the requirement when no document was uploaded
+            service.sync_spec_from_cvat(session, state, client.get_labels(project_id))
+        except CvatError:
+            pass
+        return project, state
 
     @app.get("/")
     def home() -> FileResponse:
@@ -207,12 +218,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         target.write_bytes(file.file.read())
         try:
             text = spec.read_document(target)
+            images = spec.read_document_images(target)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        parsed = _with_guide(spec.extract_spec(text), text, settings)
+        existing_labels = client.get_labels(project_id)
+        parsed = _with_guide(spec.extract_spec(text), text, settings, images, existing_labels)
         service.save_spec(session, state, target.name, parsed)
-        applied = _apply_spec(client, project_id, parsed)
-        return {"spec": parsed, "version": state.spec_version, "applied": applied}
+        try:
+            applied = _apply_spec(client, project_id, parsed)
+        except CvatError as exc:
+            raise _cvat_configuration_error(exc) from exc
+        state.spec_json = dict(parsed)
+        actual = client.get_labels(project_id)
+        return {
+            "spec": parsed,
+            "version": state.spec_version,
+            "applied": applied,
+            "attribute_sync": _attribute_sync_report(parsed, actual),
+            "cvat_attribute_json": _cvat_label_attribute_json(actual),
+        }
 
     @app.post("/projects/{project_id}/requirements/analyze")
     def analyze_requirement(
@@ -224,6 +248,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _, state = open_project(project_id, client, session, who["organization"])
         folder = Path(settings.analyzer_data_dir) / "uploads" / str(project_id)
         text = ""
+        images = []
         document_name = "requirement"
         if folder.exists():
             files = [path for path in folder.iterdir() if path.is_file()]
@@ -232,15 +257,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 document_name = latest.name
                 try:
                     text = spec.read_document(latest)
+                    images = spec.read_document_images(latest)
                 except ValueError:
                     text = ""
+                    images = []
         parsed = spec.extract_spec(text) if text else dict(state.spec_json or {})
         if not parsed.get("labels") and not text:
             raise HTTPException(status_code=400, detail="Upload a requirement before asking the agent to analyze it.")
-        parsed = _with_guide(parsed, text, settings)
+        existing_labels = client.get_labels(project_id)
+        parsed = _with_guide(parsed, text, settings, images, existing_labels)
         service.save_spec(session, state, document_name, parsed)
-        applied = _apply_spec(client, project_id, parsed)
-        return {"spec": parsed, "version": state.spec_version, "applied": applied}
+        try:
+            applied = _apply_spec(client, project_id, parsed)
+        except CvatError as exc:
+            raise _cvat_configuration_error(exc) from exc
+        state.spec_json = dict(parsed)
+        actual = client.get_labels(project_id)
+        return {
+            "spec": parsed,
+            "version": state.spec_version,
+            "applied": applied,
+            "attribute_sync": _attribute_sync_report(parsed, actual),
+            "cvat_attribute_json": _cvat_label_attribute_json(actual),
+        }
 
     @app.get("/projects/{project_id}/brief")
     def project_brief(
@@ -260,7 +299,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session: Session = Depends(db),
     ) -> dict:
         _, state = open_project(project_id, client, session, who["organization"])
-        return {"version": state.spec_version, "spec": state.spec_json or {}}
+        labels = client.get_labels(project_id)
+        return {
+            "version": state.spec_version,
+            "spec": state.spec_json or {},
+            "cvat_labels": labels,
+        }
 
     @app.post("/projects/{project_id}/spec/answers")
     def answer(
@@ -299,14 +343,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict:
         _, state = open_project(project_id, client, session, who["organization"])
         existing = client.get_labels(project_id)
-        diff = spec.diff_labels(state.spec_json or {}, existing)
-        patch = service.label_patch(diff, existing, body.confirm_type_changes)
-        if patch:
-            try:
-                client.patch_project_labels(project_id, patch)
-            except CvatError as exc:
-                raise HTTPException(status_code=exc.status, detail="CVAT refused the label update") from exc
-        return {"applied": len(patch), "diff": spec.diff_labels(state.spec_json or {}, client.get_labels(project_id))}
+        parsed = dict(state.spec_json or {})
+        diff = spec.diff_labels(parsed, existing)
+        try:
+            applied, actual = _apply_and_verify_labels(
+                client, project_id, parsed, existing, diff, body.confirm_type_changes
+            )
+        except CvatError as exc:
+            raise _cvat_configuration_error(exc) from exc
+        state.spec_json = dict(parsed)
+        return {
+            "applied": applied,
+            "diff": spec.diff_labels(state.spec_json or {}, actual),
+            "attribute_sync": _attribute_sync_report(parsed, actual),
+            "cvat_attribute_json": _cvat_label_attribute_json(actual),
+        }
 
     @app.get("/projects/{project_id}/plan")
     def plan(
@@ -438,7 +489,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session.add(run)
         session.flush()
         try:
-            summary = run_annotation(session, client, state, body.task_id, run, settings, shape=body.shape or "auto")
+            scope = _frame_scope(body.start_frame, body.end_frame, body.frames, body.only_new)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        try:
+            summary = run_annotation(
+                session, client, state, body.task_id, run, settings, shape=body.shape or "auto", scope=scope
+            )
         except CvatError as exc:
             run.status = "failed"
             run.message = "CVAT refused the annotation write"
@@ -475,7 +532,46 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict:
         _, state = open_project(project_id, client, session, who["organization"])
         learned = learn_finished_jobs(session, client, state, settings)
-        return {"samples": learned, "finished_frames": state.finished_frames}
+        auto = auto_annotate_new_tasks(session, client, state, settings)
+        return {"samples": learned, "finished_frames": state.finished_frames, "auto_annotated": auto}
+
+    @app.get("/projects/{project_id}/label-memory")
+    def label_memory(
+        project_id: int,
+        who: dict = Depends(identity),
+        client: CvatClient = Depends(cvat_client),
+        session: Session = Depends(db),
+    ) -> dict:
+        """What the agent has learned about each project label from manual annotation."""
+        _, state = open_project(project_id, client, session, who["organization"])
+        try:
+            names = [item["name"] for item in _annotation_labels(client.get_labels(project_id))]
+        except CvatError as exc:
+            raise HTTPException(status_code=exc.status, detail="CVAT could not read the labels") from exc
+        rows = session.scalars(select(Sample).where(Sample.cvat_project_id == project_id)).all()
+        notes = labelmemory.derive_label_notes(
+            [{"frame_key": f"{row.job_id}:{row.frame}", "items": row.items_json} for row in rows]
+        )
+        report = labelmemory.memory_report(session, project_id, names, notes)
+        return {
+            "label_source": "requirement and CVAT"
+            if (state.spec_json or {}).get("labels") and (state.spec_json or {}).get("source") != service.CVAT_SOURCE
+            else "CVAT project labels",
+            "learning_enabled": state.learn_enabled,
+            "finished_frames": state.finished_frames,
+            **report,
+        }
+
+    @app.delete("/projects/{project_id}/label-memory")
+    def forget_label_memory(
+        project_id: int,
+        label: str | None = None,
+        who: dict = Depends(identity),
+        client: CvatClient = Depends(cvat_client),
+        session: Session = Depends(db),
+    ) -> dict:
+        open_project(project_id, client, session, who["organization"])
+        return {"removed": labelmemory.reset_memory(session, project_id, label)}
 
     @app.post("/projects/{project_id}/jobs/{job_id}/learn")
     def learn_saved_job(
@@ -677,7 +773,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"frames": diff}
 
     @app.post("/webhooks/cvat")
-    async def cvat_webhook(request: Request, session: Session = Depends(db)) -> dict:
+    async def cvat_webhook(request: Request, background: BackgroundTasks, session: Session = Depends(db)) -> dict:
         raw = await request.body()
         _verify_signature(raw, request.headers.get("x-signature-256"), settings.webhook_secret)
         payload = json.loads(raw.decode("utf-8"))
@@ -693,6 +789,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         if not service.remember_event(session, dedupe, {"event": event, "job_id": job.get("id")}):
             return {"status": "duplicate"}
+        if event == "create:job" and job.get("project_id") and job.get("task_id"):
+            background.add_task(_annotate_new_task_in_background, sessions, settings, int(job["project_id"]), int(job["task_id"]))
+            return {"status": "auto_annotation_queued"}
         if event == "update:job" and job.get("state") == "completed" and job.get("project_id"):
             if not settings.cvat_access_token:
                 return {"status": "stored", "learning": "waiting_for_service_token"}
@@ -734,6 +833,86 @@ def _verify_signature(raw: bytes, header: str | None, secret: str) -> None:
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
 
+def auto_annotate_new_tasks(
+    session: Session, client: CvatClient, state, settings: Settings, only_task: int | None = None, limit: int = 3
+) -> list[dict]:
+    """Annotate tasks nobody has touched yet, when the project is set to "The agent annotates first".
+
+    Works for projects and tasks made by hand in CVAT: the labels come from CVAT, and the agent
+    applies what it learned from earlier manual annotation. A task is annotated once: a task with
+    a run already, or with shapes on it, is left alone.
+    """
+    if state.annotation_mode != "auto_first" or not settings.anthropic_api_key:
+        return []
+    try:
+        tasks = [client.get_task(only_task)] if only_task else client.list_tasks(state.cvat_project_id)
+    except CvatError:
+        return []
+    results: list[dict] = []
+    for task in tasks[:30]:
+        if len(results) >= limit:
+            break
+        task_id = int(task["id"])
+        if task.get("project_id") != state.cvat_project_id or not int(task.get("size") or 0):
+            continue
+        previous = session.scalar(
+            select(Run)
+            .where(Run.cvat_project_id == state.cvat_project_id, Run.task_id == task_id, Run.status != "failed")
+            .order_by(Run.id.desc())
+        )
+        scope = None
+        if previous is not None:
+            # Images added to an annotated task later: annotate only the new ones.
+            if not (0 < int(previous.total or 0) < int(task.get("size") or 0)):
+                continue
+            scope = service.FrameScope(start=int(previous.total), only_new=True)
+        try:
+            drawn = 0 if scope else sum(
+                len(client.get_annotations("jobs", int(job["id"])).get("shapes") or [])
+                + len(client.get_annotations("jobs", int(job["id"])).get("tracks") or [])
+                for job in client.get_jobs(task_id=task_id)
+            )
+        except CvatError:
+            continue
+        if drawn:
+            continue
+        run = Run(
+            cvat_project_id=state.cvat_project_id,
+            task_id=task_id,
+            status="running",
+            mode=state.annotation_mode,
+            profile_version=state.profile_version if state.learn_enabled else 0,
+        )
+        session.add(run)
+        session.flush()
+        try:
+            summary = run_annotation(session, client, state, task_id, run, settings, scope=scope)
+        except CvatError:
+            run.status = "failed"
+            run.message = "CVAT refused the annotation write"
+            continue
+        results.append({"task_id": task_id, "written": summary.get("written", 0), "message": summary.get("message")})
+    return results
+
+
+def _annotate_new_task_in_background(sessions, settings: Settings, project_id: int, task_id: int) -> None:
+    if not settings.cvat_access_token:
+        return
+    session = sessions()
+    worker = CvatClient(settings.cvat_base_url, settings.cvat_access_token, settings.cvat_auth_scheme, None)
+    try:
+        state = get_project(session, project_id)
+        service.sync_spec_from_cvat(session, state, worker.get_labels(project_id))
+        auto_annotate_new_tasks(session, worker, state, settings, only_task=task_id)
+        session.commit()
+    except Exception:
+        session.rollback()
+        logging.getLogger(__name__).exception("automatic annotation failed for task %s", task_id)
+    finally:
+        worker.close()
+        session.close()
+
+
 def _ensure_webhook(client: CvatClient, state, settings: Settings) -> None:
     if state.webhook_id or not settings.analyzer_webhook_url or not settings.webhook_secret:
         return
@@ -742,7 +921,7 @@ def _ensure_webhook(client: CvatClient, state, settings: Settings) -> None:
             state.cvat_project_id,
             settings.analyzer_webhook_url,
             settings.webhook_secret,
-            ["update:job", "update:task"],
+            ["update:job", "update:task", "create:job"],
         )
     except CvatError:
         return
@@ -762,27 +941,209 @@ def _apply_spec(client: CvatClient, project_id: int, parsed: dict) -> int:
         ]
         replaced = len(replace_ids)
     diff = spec.diff_labels(parsed, existing)
-    patch = service.label_patch(diff, existing, False)
-    if patch:
-        client.patch_project_labels(project_id, patch)
-    return replaced + len(patch)
+    applied, _ = _apply_and_verify_labels(client, project_id, parsed, existing, diff, False)
+    return replaced + applied
 
 
-def _with_guide(parsed: dict, text: str, settings: Settings) -> dict:
+def _apply_and_verify_labels(client, project_id: int, parsed: dict, existing: list[dict], diff: dict, confirm: bool) -> tuple[int, list[dict]]:
+    """Apply a label diff, read CVAT back, and retry only idempotent updates to known labels."""
+    applied = 0
+    current = existing
+    current_diff = diff
+    errors = []
+    for attempt in range(2):
+        patch = service.label_patch(current_diff, current, confirm)
+        if patch:
+            client.patch_project_labels(project_id, patch)
+            applied += len(patch)
+        actual = client.get_labels(project_id)
+        errors = _attribute_configuration_errors(parsed, actual)
+        if not errors:
+            _record_configuration_status(parsed, diff, actual)
+            return applied, actual
+        required_names = {item.get("name") for item in parsed.get("labels") or [] if item.get("attributes")}
+        known_names = {
+            item.get("name") for item in current if not item.get("parent_id") and not item.get("has_parent")
+        }
+        if attempt or not required_names.issubset(known_names):
+            break
+        current = actual
+        current_diff = spec.diff_labels(parsed, current)
+    raise CvatError(502, json.dumps({"message": "CVAT did not persist all required label attributes after readback", "mismatches": errors}))
+
+
+def _attribute_configuration_errors(parsed: dict, actual: list[dict]) -> list[dict]:
+    from .service import _attribute_body
+
+    existing = {
+        item.get("name"): item
+        for item in actual
+        if not item.get("parent_id") and not item.get("has_parent")
+    }
+    errors = []
+    for label in parsed.get("labels") or []:
+        attributes = label.get("attributes") or []
+        if not attributes:
+            continue
+        current_label = existing.get(label.get("name"))
+        if current_label is None:
+            errors.append({"label": label.get("name"), "problem": "label is missing from CVAT"})
+            continue
+        found = {str(item.get("name") or "").casefold(): item for item in current_label.get("attributes") or []}
+        for requirement_attr in attributes:
+            name = str(requirement_attr.get("name") or "")
+            saved = found.get(name.casefold())
+            if saved is None:
+                errors.append({"label": label.get("name"), "attribute": name, "problem": "attribute is missing from CVAT"})
+                continue
+            expected = _attribute_body(requirement_attr)
+            for field in ("input_type", "values", "default_value", "mutable"):
+                actual_value = list(saved.get(field) or []) if field == "values" else saved.get(field)
+                expected_value = list(expected.get(field) or []) if field == "values" else expected.get(field)
+                if actual_value != expected_value:
+                    errors.append({
+                        "label": label.get("name"),
+                        "attribute": name,
+                        "field": field,
+                        "expected": expected_value,
+                        "actual": actual_value,
+                    })
+    return errors
+
+
+def _cvat_label_attribute_json(actual: list[dict]) -> list[dict]:
+    """Return the unmodified CVAT readback for every project label, including ids and attributes."""
+    return [dict(item) for item in actual if not item.get("parent_id") and not item.get("has_parent")]
+
+
+def _attribute_sync_report(parsed: dict, actual: list[dict]) -> dict:
+    required = sum(len(item.get("attributes") or []) for item in parsed.get("labels") or [])
+    mismatches = _attribute_configuration_errors(parsed, actual)
+    warnings = [parsed["extraction_warning"]] if parsed.get("extraction_warning") else []
+    return {
+        "status": (
+            "failed" if mismatches else "extraction_incomplete" if warnings
+            else "no_attributes_extracted" if not required else "verified"
+        ),
+        "required_attribute_count": required,
+        "verified_attribute_count": max(
+            0,
+            required - len({(item.get("label"), item.get("attribute")) for item in mismatches}),
+        ) if required else 0,
+        "mismatches": mismatches,
+        "warnings": warnings,
+    }
+
+
+def _cvat_configuration_error(exc: CvatError) -> HTTPException:
+    try:
+        response = json.loads(exc.detail)
+    except (TypeError, json.JSONDecodeError):
+        response = exc.detail
+    return HTTPException(
+        status_code=exc.status,
+        detail={"message": "CVAT attribute configuration or readback failed", "response_body": response},
+    )
+
+
+def _record_configuration_status(parsed: dict, diff: dict, actual: list[dict]) -> None:
+    """Remember which requirement attributes this apply added or changed for the report."""
+    previous = parsed.get("_configuration_status") or {}
+    previous_labels = previous.get("labels") or {}
+    changed_attributes = {
+        (entry["name"], attr["name"]): attr["action"]
+        for entry in diff.get("update") or []
+        for attr in entry.get("attributes") or []
+    }
+    created_labels = {item["name"] for item in diff.get("create") or []}
+    requirement_labels = {
+        item.get("name"): item for item in parsed.get("labels") or [] if item.get("name")
+    }
+    statuses = {}
+    for label in actual:
+        name = label.get("name")
+        if label.get("parent_id") or label.get("has_parent") or not name:
+            continue
+        requirement = requirement_labels.get(name)
+        old = previous_labels.get(name) or {}
+        if requirement is None:
+            continue
+        attr_statuses = dict(old.get("attributes") or {})
+        for attr in label.get("attributes") or []:
+            attr_name = attr.get("name")
+            if not attr_name or not any(item.get("name") == attr_name for item in requirement.get("attributes") or []):
+                continue
+            action = changed_attributes.get((name, attr_name))
+            if action == "add":
+                attr_statuses[attr_name] = "newly added"
+            elif action == "change":
+                attr_statuses[attr_name] = "updated from requirement"
+            else:
+                attr_statuses.setdefault(attr_name, "already existed")
+        status = "updated from requirement" if name in created_labels or any(
+            key[0] == name for key in changed_attributes
+        ) else old.get("status", "unchanged")
+        statuses[name] = {"status": status, "attributes": attr_statuses}
+    parsed["_configuration_status"] = {"labels": statuses}
+
+
+def _with_guide(
+    parsed: dict, text: str, settings: Settings, images: list[dict] | None = None, existing_labels: list[dict] | None = None
+) -> dict:
     from .vision import VisionError, analyze_requirement
 
     try:
-        guide = analyze_requirement(settings.anthropic_api_key, settings.anthropic_model, text, parsed)
-    except (VisionError, httpx.HTTPError):
+        guide = analyze_requirement(settings.anthropic_api_key, settings.anthropic_model, text, parsed, images, existing_labels)
+    except (VisionError, httpx.HTTPError) as exc:
         guide = spec.explain_requirement(parsed)
-    return spec.apply_guide(parsed, guide)
+        parsed["extraction_warning"] = str(exc) or "The requirement analysis request failed."
+        # Local structured extraction can be complete even when the guide API
+        # fails. Keep its labels, attributes, and rules instead of returning an
+        # empty specification that looks like the document contained no classes.
+        if parsed.get("labels"):
+            guide["decisions"] = [
+                {
+                    "name": item.get("name"),
+                    "type": item.get("type"),
+                    "attributes": item.get("attributes") or [],
+                    "keypoints": item.get("keypoints") or [],
+                    "edges": item.get("edges") or [],
+                }
+                for item in parsed["labels"]
+            ]
+    updated = spec.apply_guide(parsed, guide)
+    if guide.get("extraction_warning"):
+        updated["extraction_warning"] = guide["extraction_warning"]
+    return updated
 
 
-def run_annotation(session: Session, client: CvatClient, state, task_id: int, run: Run, settings: Settings, detect=None, shape: str = "auto") -> dict:
+def _frame_scope(start: int | None, end: int | None, frames: str | None, only_new: bool) -> service.FrameScope:
+    if (start is not None and start < 0) or (end is not None and end < 0):
+        raise ValueError("Frame numbers start at 0")
+    if start is not None and end is not None and end < start:
+        raise ValueError("The end frame is before the start frame")
+    return service.FrameScope(
+        start=start, end=end, frames=service.parse_frame_selection(frames), only_new=bool(only_new)
+    )
+
+
+def run_annotation(
+    session: Session,
+    client: CvatClient,
+    state,
+    task_id: int,
+    run: Run,
+    settings: Settings,
+    detect=None,
+    shape: str = "auto",
+    scope: service.FrameScope | None = None,
+) -> dict:
     task = client.get_task(task_id)
-    if task.get("project_id") != state.cvat_project_id:
+    in_project = task.get("project_id") == state.cvat_project_id
+    if not in_project and task.get("project_id") is not None:
         raise HTTPException(status_code=404, detail="That task is not in this project")
-    labels = client.get_labels(state.cvat_project_id)
+    # A task inside the project uses the project's labels. A task created without a project keeps its own.
+    labels = client.get_labels(state.cvat_project_id) if in_project else client.get_task_labels(task_id)
     jobs = client.get_jobs(task_id=task_id)
     if not int(task.get("size") or 0) or not jobs:
         run.status = "finished"
@@ -790,6 +1151,9 @@ def run_annotation(session: Session, client: CvatClient, state, task_id: int, ru
         return {"written": 0, "flagged": 0, "message": run.message}
     if state.learn_enabled:
         learn_finished_jobs(session, client, state, settings)
+        if not in_project:
+            for job in jobs:
+                learn_job(session, client, state, job, settings, event_key="user-edit")
     profile = state.profile_json if state.learn_enabled else {"rules": []}
     lesson_rows = session.scalars(select(Sample).where(Sample.cvat_project_id == state.cvat_project_id)).all()
     lessons = prompt_lessons(profile, [{"items": row.items_json} for row in lesson_rows]) if state.learn_enabled else []
@@ -816,8 +1180,22 @@ def run_annotation(session: Session, client: CvatClient, state, task_id: int, ru
         )
     if not spec_labels:
         run.status = "finished"
-        run.message = "This project has no labels yet. Read the requirement and apply the labels first."
+        where = "project" if in_project else "task (it is not in a project)"
+        run.message = (
+            f"No labels were found on this {where}. Add the labels in CVAT on the "
+            f"{'project' if in_project else 'task'}, or upload a requirement and apply its labels."
+        )
         return {"written": 0, "flagged": 0, "message": run.message}
+    service.sync_spec_from_cvat(session, state, labels)
+    has_requirement = (state.spec_json or {}).get("source") != service.CVAT_SOURCE and bool(
+        (state.spec_json or {}).get("labels")
+    )
+    notes: dict[str, dict] = {}
+    exemplars: list[dict] = []
+    if state.learn_enabled:
+        notes = labelmemory.derive_label_notes([{"frame_key": f"{row.job_id}:{row.frame}", "items": row.items_json} for row in lesson_rows])
+        labelmemory.apply_notes(spec_labels, notes)
+        exemplars = labelmemory.select_exemplars(session, state.cvat_project_id, [item["name"] for item in spec_labels])
     requested = (shape or "auto").strip().lower()
     if requested not in {"auto", "rectangle", "polygon", "mask", "polyline", "points", "ellipse", "skeleton", "cuboid"}:
         run.status = "finished"
@@ -829,8 +1207,11 @@ def run_annotation(session: Session, client: CvatClient, state, task_id: int, ru
             run.status = "finished"
             run.message = f"This project has no {requested} label, so that shape was not drawn."
             return {"written": 0, "flagged": 0, "message": run.message}
+    scope = scope or service.FrameScope()
+    annotated_frames = 0
     written = 0
     flagged = 0
+    found = matched = invalid = 0
     manual_frames: set[int] = set()
     run.total = sum(int(job.get("stop_frame", 0)) - int(job.get("start_frame", 0)) + 1 for job in jobs)
     video = task.get("mode") == "interpolation"
@@ -849,26 +1230,31 @@ def run_annotation(session: Session, client: CvatClient, state, task_id: int, ru
             return {"written": written, "flagged": flagged}
         start = int(job.get("start_frame") or 0)
         stop = int(job.get("stop_frame") or start)
+        if not scope.overlaps(start, stop):
+            run.progress += stop - start + 1
+            continue
         try:
             client.clear_review_issues(int(job["id"]))
         except CvatError:
             pass
         existing = client.get_annotations("jobs", job["id"])
-        manual_frames = {
-            int(shape.get("frame") or 0)
-            for shape in existing.get("shapes") or []
-            if shape.get("source") == "manual"
-        }
+        existing_shape_frames = service.drawn_frames(existing, start, stop)
+        drawn = existing_shape_frames
+        replaced_frames: set[int] = set()
         per_frame: dict[int, list[dict]] = {}
         for frame in range(start, stop + 1):
             if run.cancel_requested:
                 run.status = "cancelled"
                 return {"written": written, "flagged": flagged}
             run.progress += 1
-            if frame in manual_frames:
+            if frame in existing_shape_frames or not scope.wants(frame, drawn):
                 continue
-            raw = _detect(client, settings, task_id, frame, spec_labels, detect, lessons)
+            replaced_frames.add(frame)
+            annotated_frames += 1
+            raw = _detect(client, settings, task_id, frame, spec_labels, detect, lessons, exemplars)
             adapted = service.shapes_for_labels(raw, spec_labels, profile)
+            found += len(raw)
+            matched += len(adapted)
             per_frame[frame] = adapted
         if video and per_frame:
             per_frame = service.associate_by_iou(
@@ -898,7 +1284,7 @@ def run_annotation(session: Session, client: CvatClient, state, task_id: int, ru
         cvat_tracks = service.to_cvat_tracks(
             per_frame,
             {item["name"]: item for item in labels},
-            end_frame=stop,
+            end_frame=stop if scope.is_full or not replaced_frames else max(replaced_frames),
             frame_size=frame_size,
         ) if video else []
         for frame, shapes in per_frame.items():
@@ -919,10 +1305,13 @@ def run_annotation(session: Session, client: CvatClient, state, task_id: int, ru
                     if payload:
                         cvat_shapes.append(payload)
                         written += 1
+                    else:
+                        invalid += 1
+        # Everything on frames this run did not redraw stays as it was.
         kept = [
             shape
             for shape in existing.get("shapes") or []
-            if int(shape.get("frame") or 0) in manual_frames
+            if int(shape.get("frame") or 0) not in replaced_frames
         ]
         if video:
             written += sum(1 for track in cvat_tracks for item in track["shapes"] if not item.get("outside"))
@@ -930,6 +1319,10 @@ def run_annotation(session: Session, client: CvatClient, state, task_id: int, ru
             track
             for track in existing.get("tracks") or []
             if track.get("source") == "manual"
+            or (
+                not scope.is_full
+                and not any(int(point.get("frame") or 0) in replaced_frames for point in track.get("shapes") or [])
+            )
         ]
         if cvat_shapes or cvat_tracks or kept != (existing.get("shapes") or []):
             client.put_annotations(
@@ -943,17 +1336,46 @@ def run_annotation(session: Session, client: CvatClient, state, task_id: int, ru
                 },
             )
     run.status = "finished"
-    if written == 0 and not manual_frames:
+    if not scope.is_full and annotated_frames == 0:
+        run.message = (
+            f"No images matched ({scope.describe()}). Frame numbers start at 0. "
+            "Images that already have shapes, or that you drew by hand, are skipped."
+        )
+        return {"written": 0, "flagged": 0, "message": run.message}
+    if annotated_frames == 0:
+        run.message = "No images without existing annotation shapes were available to annotate. Existing shapes were left unchanged."
+        return {"written": 0, "flagged": 0, "message": run.message}
+    if written == 0:
         detail = _detect_error or _empty_annotation_reason(spec_labels)
+        if not _detect_error:
+            if found == 0:
+                detail = "The vision agent returned no objects for any image, so nothing was found to draw."
+            elif matched == 0:
+                detail = f"The agent found {found} object(s), but none had a name matching a project label."
+            elif invalid:
+                detail = (
+                    f"The agent found {found} object(s) and {matched} matched a label, but {invalid} could not be "
+                    "saved because their outline was invalid (polygon too small, self-crossing, or a mask without data)."
+                )
         run.message = "No shapes were added. " + detail
     else:
+        source = "the requirement" if has_requirement else "the project's labels in CVAT"
+        parts = []
+        if lessons:
+            parts.append(f"Applied {len(lessons)} correction(s) learned from this project.")
+        if exemplars:
+            parts.append(f"Showed the agent {len(exemplars)} example(s) of what your annotators drew.")
+        if notes:
+            parts.append(f"Used habits learned for {len(notes)} label(s).")
         learned = (
-            f" Applied {len(lessons)} correction(s) learned from this project."
-            if lessons
-            else " No saved corrections were found yet, so this pass follows the requirement."
+            " " + " ".join(parts)
+            if parts
+            else f" Nothing has been learned from this project yet, so this pass follows {source}. "
+            "Annotate a few images by hand, save, and the next pass learns from them."
         )
+        where = f" Annotated {annotated_frames} image(s): {scope.describe()}." if not scope.is_full else ""
         run.message = (
-            f"Added {written} shapes.{learned} "
+            f"Added {written} shapes.{where}{learned} "
             "Save your edits in this project and the next task follows them. "
             "Frames you already edited were left as you drew them."
         )
@@ -994,7 +1416,7 @@ def _empty_annotation_reason(labels: list[dict]) -> str:
     return "The vision agent did not find any labels that belong to this project."
 
 
-def _detect(client, settings: Settings, task_id: int, frame: int, labels: list[dict], detect, lessons: list[str] | None = None) -> list[dict]:
+def _detect(client, settings: Settings, task_id: int, frame: int, labels: list[dict], detect, lessons: list[str] | None = None, exemplars: list[dict] | None = None) -> list[dict]:
     global _detect_error
     if detect is not None:
         return detect(frame, labels)
@@ -1004,7 +1426,13 @@ def _detect(client, settings: Settings, task_id: int, frame: int, labels: list[d
     image = client.get_frame(task_id, frame)
     try:
         raw = annotate_image(
-            settings.anthropic_api_key, settings.anthropic_model, image, labels, lessons or [], refine=settings.annotation_refine
+            settings.anthropic_api_key,
+            settings.anthropic_model,
+            image,
+            labels,
+            lessons or [],
+            refine=settings.annotation_refine,
+            exemplars=exemplars,
         )
     except Exception as exc:
         _detect_error = str(exc)[:240]
@@ -1223,7 +1651,10 @@ def _export_shape(shape: dict, labels: dict[int, dict]) -> dict:
 def learn_job(session: Session, client: CvatClient, state, job: dict, settings: Settings, event_key: str | None = None, apply_forward: bool = False) -> int:
     if not state.learn_enabled:
         return 0
-    labels = {item["id"]: item for item in client.get_labels(state.cvat_project_id)}
+    if job.get("project_id") is None and job.get("task_id"):
+        labels = {item["id"]: item for item in client.get_task_labels(int(job["task_id"]))}
+    else:
+        labels = {item["id"]: item for item in client.get_labels(state.cvat_project_id)}
     annotations = client.get_annotations("jobs", job["id"])
     frames = service.group_frames(annotations, labels)
     event_key = event_key or str(job.get("updated_date") or job.get("id"))
@@ -1251,7 +1682,7 @@ def learn_job(session: Session, client: CvatClient, state, job: dict, settings: 
         snapshot = predicted.get(frame) or previous.get(frame) or []
         if state.compare_with_agent and not snapshot:
             snapshot = _quiet_comparison(client, settings, int(job.get("task_id") or 0), int(frame), list(labels.values()))
-        service.record_frame(
+        items = service.record_frame(
             session,
             state,
             task_id=int(job.get("task_id") or 0),
@@ -1261,6 +1692,19 @@ def learn_job(session: Session, client: CvatClient, state, job: dict, settings: 
             snapshot=snapshot,
             final=frames.get(frame, []),
         )
+        try:
+            labelmemory.capture_frame(
+                session,
+                client,
+                state.cvat_project_id,
+                int(job.get("task_id") or 0),
+                job_id,
+                int(frame),
+                items,
+                known_labels={item.get("name") for item in labels.values()},
+            )
+        except Exception:  # learning what a label looks like must never break saving or annotating
+            logging.getLogger(__name__).exception("label memory capture failed")
         count += 1
     if apply_forward and frames:
         snapshots = {

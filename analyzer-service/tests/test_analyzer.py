@@ -187,6 +187,96 @@ Keypoints: nose, left_shoulder, right_shoulder
     assert hand["keypoints"] == ["wrist", "thumb"]
 
 
+def test_vehicle_attribute_requirement_template_reads_approved_classes_and_choices():
+    from app.spec import extract_spec
+
+    document = """
+    Vehicle Classification & Attribute Annotation
+    1. Vehicle Labels — Client to Select
+    car Passenger car / sedan / hatchback / SUV (client to confirm grouping) ■ Required ■ Not required
+    truck Truck / lorry ■ Required ■ Not required
+    bus Bus ■ Required ■ Not required
+    van Van / minivan ■ Required ■ Not required
+    motorcycle Motorcycle / scooter ■ Required ■ Not required
+    bicycle Bicycle ■ Required ■ Not required
+    other_vehicle Other vehicle type ■ Required ■ Not required
+    2. Vehicle Attributes — Mark Each Attribute
+    Attribute key Property Suggested values Client decision
+    vehicle_color Main exterior color white, black, grey, red, blue ■ Yes / ■ No / ■ N/A
+    vehicle_subtype More specific body/type sedan, SUV, pickup, minivan ■ Yes / ■ No / ■ N/A
+    """
+    parsed = extract_spec(document)
+    assert [item["name"] for item in parsed["labels"]] == [
+        "car", "truck", "bus", "van", "motorcycle", "bicycle", "other_vehicle",
+    ]
+    assert all(item["type"] == "rectangle" for item in parsed["labels"])
+    # Template suggestions have not been approved, so don't create CVAT attrs yet.
+    assert all(not item["attributes"] for item in parsed["labels"])
+
+
+def test_vehicle_detection_docx_tables_read_required_but_skip_optional_attributes(tmp_path):
+    from docx import Document
+    from app.spec import read_document
+
+    path = tmp_path / "vehicle-requirements.docx"
+    document = Document()
+    document.add_paragraph("VEHICLE DETECTION ANNOTATION GUIDELINES")
+    document.add_paragraph("4. Required Attributes")
+    document.add_paragraph("5. Optional Attributes (Client Confirmation Required)")
+    table = document.add_table(rows=1, cols=3)
+    for cell, value in zip(table.rows[0].cells, ["Label", "Definition / inclusion rule", "Examples"]):
+        cell.text = value
+    for row in [
+        ("car", "Passenger vehicle", "Sedan, hatchback"),
+        ("auto_rickshaw", "Three-wheeled vehicle", "Passenger auto"),
+        ("other_vehicle", "Other vehicle", "Special-purpose vehicle"),
+    ]:
+        cells = table.add_row().cells
+        for cell, value in zip(cells, row):
+            cell.text = value
+    for header, rows in [
+        ("Attribute", [
+            ("vehicle_color", "white, black, unknown", "Dominant visible body color"),
+            ("truncation", "no, yes", "Cut off by frame"),
+        ]),
+        ("Attribute", [("vehicle_make", "Toyota, Honda, unknown", "Optional make")]),
+    ]:
+        attr_table = document.add_table(rows=1, cols=3)
+        for cell, value in zip(attr_table.rows[0].cells, [header, "Allowed values", "Instruction"]):
+            cell.text = value
+        for row in rows:
+            cells = attr_table.add_row().cells
+            for cell, value in zip(cells, row):
+                cell.text = value
+    document.save(path)
+
+    parsed = extract_spec(read_document(path))
+    assert [item["name"] for item in parsed["labels"]] == ["car", "auto_rickshaw", "other_vehicle"]
+    assert all(item["type"] == "rectangle" for item in parsed["labels"])
+    assert [item["name"] for item in parsed["labels"][0]["attributes"]] == ["vehicle_color", "truncation"]
+    assert all(item["required"] is True for item in parsed["labels"][0]["attributes"])
+    assert parsed["optional_attributes_not_applied"] == ["vehicle_make"]
+
+
+def test_requirement_guide_failure_keeps_locally_extracted_labels_and_attributes():
+    from app.config import Settings
+    from app.main import _with_guide
+
+    parsed = extract_spec("""Label: car
+Type: rectangle
+Attribute: color
+Input: select
+Values: white, black
+Default:
+Required: yes
+""")
+    settings = Settings(anthropic_api_key="")
+    # A missing key is a supported local-only mode; the parsed schema remains usable.
+    result = _with_guide(parsed, "", settings)
+    assert result["labels"][0]["name"] == "car"
+    assert result["labels"][0]["attributes"][0]["name"] == "color"
+
+
 def test_requirement_can_add_skeleton_keypoints_and_tracking():
     from app.spec import explain_requirement
 
@@ -922,6 +1012,52 @@ def test_review_flags_and_self_crossing_and_tracks():
     )
     assert linked[0][0]["track_id"] == linked[1][0]["track_id"]
     assert resample_polygon([0, 0, 10, 0, 10, 10, 0, 10], 4)
+
+
+def test_run_does_not_replace_existing_shapes_and_only_detects_empty_frames(tmp_path):
+    from app.db import Run
+    from app.main import run_annotation
+    from app.service import get_project
+
+    client, fake = _client(tmp_path)
+    fake.labels = [{"id": 1, "name": "car", "type": "rectangle", "attributes": []}]
+    existing = {
+        "id": 100,
+        "frame": 0,
+        "label_id": 1,
+        "type": "rectangle",
+        "points": [2, 2, 22, 22],
+        "source": "auto",
+        "attributes": [],
+    }
+    fake.annotations = {"shapes": [existing], "tracks": [], "tags": []}
+    calls = []
+
+    def detect(frame, labels):
+        calls.append(frame)
+        return [{"label": "car", "type": "rectangle", "points": [30, 10, 60, 40], "score": 0.9}]
+
+    session = client.app.state.sessions()
+    state = get_project(session, 1)
+    run = Run(cvat_project_id=1, task_id=7, status="running")
+    session.add(run)
+    session.flush()
+    result = run_annotation(session, fake, state, 7, run, client.app.state.settings, detect=detect)
+    assert calls == [1]
+    assert result["written"] == 1
+    assert fake.shapes[0] == existing
+    assert fake.shapes[1]["frame"] == 1
+    session.close()
+
+
+def test_drawn_frames_includes_interpolated_track_frames():
+    from app.service import drawn_frames
+
+    annotations = {"shapes": [], "tracks": [{"shapes": [
+        {"frame": 2, "outside": False},
+        {"frame": 6, "outside": True},
+    ]}]}
+    assert drawn_frames(annotations, 0, 8) == {2, 3, 4, 5}
 
 
 class FakeCvat:
