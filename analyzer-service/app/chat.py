@@ -73,6 +73,10 @@ TOOLS = [
                     "type": "boolean",
                     "description": "Skip images that already have shapes. Use this after images were added to a task.",
                 },
+                "rotated_boxes": {
+                    "type": "boolean",
+                    "description": "Set true only when the user explicitly asks for rotated/oriented bounding boxes.",
+                },
             },
             "required": ["project_id", "task_id"],
         },
@@ -269,6 +273,7 @@ When the user says something is wrong, or asks to change labels or the requireme
 - For example, "give the car label color attribute values red, black, blue" means add or update a select attribute named color on the existing car label with exactly those three values. Call update_requirement now; do not suggest making separate labels or editing CVAT manually.
 - the requirement describes attributes in sentences: call analyze_requirement. It reads them and adds them to the CVAT labels.
 - images were added to a task, or the user names images, a range, or a start and end frame: call annotate_task with only_new, start_frame and end_frame, or frames. Frame numbers start at 0. Do not redraw the other images.
+- rotated or oriented bounding boxes: set rotated_boxes=true only when the project requirement or user explicitly asks for them. Leave it unset otherwise.
 - the project or task was made by hand in CVAT with labels but no requirement document: the labels in CVAT are the requirement. Call annotate_task. The agent learns from what people draw by hand. Never ask for a document first.
 - image files are attached: call add_images on the current task, unless the user asked to replace the images or create a new task
 Do the change. Do not tell the user to upload a revised document or to click another button.
@@ -547,7 +552,10 @@ def run_tool(name: str, arguments: dict, client: CvatClient, session, settings: 
             run = Run(cvat_project_id=project_id, task_id=task_id, status="running", mode="auto_first")
             session.add(run)
             session.flush()
-            summary = run_annotation(session, client, state, task_id, run, settings, scope=scope)
+            summary = run_annotation(
+                session, client, state, task_id, run, settings, scope=scope,
+                rotated_boxes=arguments.get("rotated_boxes"),
+            )
             return json.dumps({"task_id": task_id, "written": summary.get("written"), "message": summary.get("message")})
     except CvatError as exc:
         try:

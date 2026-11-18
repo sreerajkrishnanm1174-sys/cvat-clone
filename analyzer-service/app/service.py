@@ -314,6 +314,9 @@ def rebuild_profile(session: Session, state: ProjectState) -> dict:
         for row in rows
     ]
     profile = learning.derive_profile(samples, state.spec_json or {})
+    preferences = (state.profile_json or {}).get("preferences") or {}
+    if preferences:
+        profile["preferences"] = dict(preferences)
     if profile != (state.profile_json or {"rules": []}):
         state.profile_version += 1
         state.profile_json = profile
@@ -402,6 +405,8 @@ def apply_profile_to_shape(shape: dict, profile: dict | None, label_type: str) -
         "score": score,
         "source": "auto",
     }
+    if shape.get("rotation") is not None:
+        updated["rotation"] = float(shape["rotation"])
     if shape.get("elements"):
         updated["elements"] = shape["elements"]
     if shape.get("encoded"):
@@ -1252,7 +1257,7 @@ def _track_shape(shape: dict) -> dict:
         "attributes": list(shape.get("attributes") or []),
     }
     if shape["type"] in {"rectangle", "ellipse"}:
-        payload["rotation"] = float(shape.get("rotation") or 0)
+        payload["rotation"] = float(shape.get("rotation") or 0) % 360
     return payload
 
 
@@ -1356,7 +1361,7 @@ def to_cvat_shape(shape: dict, label_ids: dict[str, dict], frame: int) -> dict |
         "occluded": bool(shape.get("occluded")),
         "outside": bool(shape.get("outside")),
         "z_order": 0,
-        "rotation": 0,
+        "rotation": float(shape.get("rotation") or 0) % 360,
         "source": "auto",
         "attributes": attributes,
         "group": int(shape.get("group_id") or 0),
@@ -1444,6 +1449,7 @@ def _from_cvat(shape: dict, label: dict, labels_by_id: dict | None = None) -> di
         "label": label.get("name"),
         "type": shape.get("type") or label.get("type"),
         "points": shape.get("points") or [],
+        "rotation": float(shape.get("rotation") or 0),
         "attributes": attributes,
         "source": shape.get("source") or "manual",
         "score": shape.get("score"),

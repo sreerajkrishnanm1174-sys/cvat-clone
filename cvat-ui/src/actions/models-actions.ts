@@ -10,6 +10,7 @@ import {
 import {
     getCore, MLModel, RQStatus,
 } from 'cvat-core-wrapper';
+import { fetchAnnotationsAsync } from './annotation-actions';
 
 export enum ModelsActionTypes {
     GET_MODELS = 'GET_MODELS',
@@ -118,6 +119,7 @@ export function getModelsAsync(query?: ModelsQuery): ThunkAction {
 function listen(
     functionRequest: Awaited<ReturnType<typeof core.lambda.requests>>[number],
     dispatch: (action: ModelsActions) => void,
+    onFinished?: () => void,
 ): void {
     const {
         id, function: func, status, progress, exc_info: error,
@@ -133,6 +135,7 @@ function listen(
             id,
         }),
     );
+    if (status === RQStatus.FINISHED) onFinished?.();
 
     core.lambda
         .listen(id, (_status: RQStatus, _progress: number, message?: string) => {
@@ -163,6 +166,7 @@ function listen(
                     id,
                 }),
             );
+            if (_status === RQStatus.FINISHED) onFinished?.();
         })
         .catch((e: unknown) => {
             const msg = e instanceof Error ? e.message : String(e);
@@ -192,7 +196,12 @@ export function getInferenceStatusAsync(): ThunkAction {
             requests
                 .forEach((functionRequest): void => {
                     if (!(functionRequest.id in requestedInferenceIDs)) {
-                        listen(functionRequest, dispatchCallback);
+                        const taskID = functionRequest.function.task;
+                        listen(functionRequest, dispatchCallback, () => {
+                            if (getState().annotation.taskInstance?.id === taskID) {
+                                dispatch(fetchAnnotationsAsync());
+                            }
+                        });
                         newListenedIDs[functionRequest.id] = true;
                     }
                 });
@@ -204,14 +213,18 @@ export function getInferenceStatusAsync(): ThunkAction {
 }
 
 export function startInferenceAsync(taskId: number, model: MLModel, body: object): ThunkAction {
-    return async (dispatch): Promise<void> => {
+    return async (dispatch, getState): Promise<void> => {
         try {
             const functionRequest = await core.lambda.run(taskId, model, body);
             const dispatchCallback = (action: ModelsActions): void => {
                 dispatch(action);
             };
 
-            listen(functionRequest, dispatchCallback);
+            listen(functionRequest, dispatchCallback, () => {
+                if (getState().annotation.taskInstance?.id === taskId) {
+                    dispatch(fetchAnnotationsAsync());
+                }
+            });
             dispatch(modelsActions.getInferencesSuccess({ [functionRequest.id]: true }));
         } catch (error) {
             dispatch(modelsActions.startInferenceFailed(taskId, error));

@@ -83,7 +83,9 @@ def labels_needing_vision(labels: list[dict], detected: list[dict]) -> list[dict
     for label in labels:
         if label.get("type") == "tag":
             continue
-        if is_detector_label(label) and label.get("name") in found:
+        # A detector locates the object but cannot fill visual attributes such as color or
+        # view. Ask vision for those values, then merge them onto the detector's same box.
+        if is_detector_label(label) and label.get("name") in found and not label.get("attributes"):
             continue
         pending.append(label)
     return pending
@@ -108,15 +110,23 @@ def dedupe_shapes(shapes: list[dict], minimum: float = 0.6) -> list[dict]:
     kept: list[dict] = []
     for shape in ordered:
         box = shape_box(shape)
-        if any(
-            shape.get("label") == other.get("label")
-            and (shape.get("type") or "rectangle") == (other.get("type") or "rectangle")
+        duplicate = next((
+            other for other in kept
+            if shape.get("label") == other.get("label")
             and (
                 iou(box, "rectangle", shape_box(other), "rectangle") >= minimum
                 or covers_same_object(box, shape_box(other))
             )
-            for other in kept
-        ):
+        ), None)
+        if duplicate is not None:
+            # The higher-confidence geometry wins; carry any attribute values found by
+            # the other pass onto that one object instead of emitting a second box.
+            attributes = dict(shape.get("attributes") or {})
+            attributes.update({
+                name: value for name, value in (duplicate.get("attributes") or {}).items()
+                if value is not None and str(value).strip()
+            })
+            duplicate["attributes"] = attributes
             continue
         kept.append(shape)
     return kept

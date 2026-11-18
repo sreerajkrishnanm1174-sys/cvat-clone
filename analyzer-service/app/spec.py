@@ -528,7 +528,9 @@ def named_format(text: str) -> str | None:
 def extract_spec(text: str) -> dict:
     embedded = _json_block(text)
     if embedded and embedded.get("labels"):
-        return _normalize(embedded)
+        parsed = _normalize(embedded)
+        parsed["rotated_boxes"] = bool(parsed.get("rotated_boxes") or wants_rotated_boxes(text))
+        return parsed
     labels = []
     questions = []
     output_format = named_format(text) or "CVAT"
@@ -626,10 +628,12 @@ def extract_spec(text: str) -> dict:
     if not labels:
         table_spec = _vehicle_detection_doc_spec(text or "")
         if table_spec:
+            table_spec["rotated_boxes"] = wants_rotated_boxes(text)
             return table_spec
     if not labels:
         table_spec = _vehicle_attribute_table_spec(text or "")
         if table_spec:
+            table_spec["rotated_boxes"] = wants_rotated_boxes(text)
             return table_spec
     if not labels:
         questions.append(
@@ -643,7 +647,17 @@ def extract_spec(text: str) -> dict:
         "output_format": output_format,
         "questions": questions,
         "tracking": _wants_tracking(text),
+        "rotated_boxes": wants_rotated_boxes(text),
     }
+
+
+def wants_rotated_boxes(text: str) -> bool:
+    """Enable oriented rectangles only when a requirement explicitly asks for them."""
+    return bool(re.search(
+        r"\b(?:rotated|oriented)\s+(?:2d\s+)?(?:bounding\s+)?boxes?\b|\boriented\s+bounding\s+box(?:es)?\b|\bobb\b|\brotation\s+angle\s+for\s+(?:the\s+)?boxes?\b",
+        text or "",
+        flags=re.I,
+    ))
 
 
 def _vehicle_attribute_table_spec(text: str) -> dict | None:
@@ -780,6 +794,7 @@ def _normalize(spec: dict) -> dict:
         "output_format": spec.get("output_format") or "CVAT",
         "questions": spec.get("questions") or [],
         "tracking": bool(spec.get("tracking")),
+        "rotated_boxes": bool(spec.get("rotated_boxes")),
     }
 
 

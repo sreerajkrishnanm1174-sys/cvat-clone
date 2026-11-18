@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import re
 
 import httpx
@@ -48,13 +49,16 @@ CLAUDE_SYSTEM = """You are an annotation agent. You get one image, a list of lab
 rules, and general guidelines. Small reference crops may come first, each with a caption saying which
 label the annotator drew. The LAST image in the message is the only one to annotate; coordinates belong
 to it alone. Find every object that matches a label and return ONLY JSON:
-{"objects":[{"label":"<exact label name>","bbox":[x1,y1,x2,y2],"polygon":[[x,y],...],
+{"objects":[{"label":"<exact label name>","bbox":[x1,y1,x2,y2],"oriented_box":[cx,cy,width,height,angle],"polygon":[[x,y],...],
 "keypoints":[{"name":"<keypoint name>","x":0,"y":0,"v":2}],"score":0.0-1.0,"attributes":{}}]}
 Coordinates are pixels in the image you were given (origin top-left).
 Each label may list attributes. For every object, fill every attribute of its label in "attributes",
 as {"<attribute name>": "<value>"}. Judge each value from what you can see. checkbox: "true" or "false".
 select and radio: exactly one of the listed values. number: a number between min and max. text: a short
 phrase. If you cannot tell from the image, use the attribute's default. Never invent an attribute name.
+Attributes describe the labeled object; they are never separate objects, labels, or boxes. Return one
+object entry and one geometry per physical object, with all of that label's attribute values attached
+to the same entry in its "attributes" field.
 "attribute_habits" says what the annotators in this project chose before. The reference crops show what each chosen
 value looks like. Follow what the image shows. Only when it does not show the value, use the usual choice.
 By label annotation_type:
@@ -104,7 +108,7 @@ def prepare_image(raw: bytes, max_side: int = 1568) -> tuple[bytes, str, float, 
     return buffer.getvalue(), "image/jpeg", scale, sent_width, sent_height
 
 
-def build_prompt(labels: list[dict], lessons: list[str], width: int, height: int) -> str:
+def build_prompt(labels: list[dict], lessons: list[str], width: int, height: int, rotated_boxes: bool = False) -> str:
     brief = []
     for label in labels:
         item = {
@@ -131,7 +135,15 @@ def build_prompt(labels: list[dict], lessons: list[str], width: int, height: int
     guidelines = "Corrections from earlier images in this project. Apply the same changes here:\n" + "\n".join(
         f"- {lesson}" for lesson in lessons
     ) if lessons else "(none)"
-    return f"Image size: {width}x{height} px.\nLabels:\n{json.dumps(brief, indent=1)}\nGeneral guidelines:\n{guidelines}"
+    rotated_guidance = (
+        "For every rectangle label, return oriented_box=[cx,cy,width,height,angle] in image pixels. "
+        "The center and width/height describe the tight rectangle BEFORE rotation. Angle is degrees clockwise, "
+        "from 0 inclusive to 360 exclusive; use 0 only when the object's long edges align with the image axes. "
+        "Estimate the object's actual orientation, even when it is strongly tilted. Do not use the axis-aligned "
+        "bbox as the oriented_box. Do not return oriented_box for polygons or other shape types.\n"
+        if rotated_boxes else ""
+    )
+    return f"Image size: {width}x{height} px.\n{rotated_guidance}Labels:\n{json.dumps(brief, indent=1)}\nGeneral guidelines:\n{guidelines}"
 
 
 def parse_shapes(text: str, labels: list[dict], scale: float, width: int, height: int) -> list[dict]:
@@ -173,6 +185,17 @@ def parse_shapes(text: str, labels: list[dict], scale: float, width: int, height
             continue
         raw_points = _keypoint_pairs(item) if kind == "points" else []
         raw_points = raw_points or _reference_points(item, kind) or item.get("points") or []
+        if kind == "rectangle" and len(raw_points) < 4:
+            oriented_box = item.get("oriented_box") or item.get("rotated_bbox")
+            if isinstance(oriented_box, (list, tuple)) and len(oriented_box) >= 5:
+                try:
+                    cx, cy, box_width, box_height = (float(value) for value in oriented_box[:4])
+                    raw_points = [
+                        cx - box_width / 2, cy - box_height / 2,
+                        cx + box_width / 2, cy + box_height / 2,
+                    ]
+                except (TypeError, ValueError):
+                    raw_points = []
         if raw_points and isinstance(raw_points[0], (list, tuple)):
             flat = []
             for pair in raw_points:
@@ -202,15 +225,40 @@ def parse_shapes(text: str, labels: list[dict], scale: float, width: int, height
         min_size = label.get("min_size") or 0
         if min_size and _too_small(points, float(min_size)):
             continue
-        shapes.append(
-            {
+        parsed = {
                 "label": label["name"],
                 "type": kind,
                 "points": [round(value, 2) for value in points],
                 "attributes": item.get("attributes") if isinstance(item.get("attributes"), dict) else {},
                 "score": _score(item),
             }
-        )
+        if kind == "rectangle":
+            try:
+                oriented_box = item.get("oriented_box") or item.get("rotated_bbox")
+                if isinstance(oriented_box, (list, tuple)) and len(oriented_box) >= 5:
+                    cx, cy, box_width, box_height, rotation = (float(value) for value in oriented_box[:5])
+                    if not all(math.isfinite(value) for value in (cx, cy, box_width, box_height, rotation)):
+                        raise ValueError("The oriented box contains a non-finite value")
+                    box_width, box_height = abs(box_width), abs(box_height)
+                    if max(abs(cx), abs(cy), abs(box_width), abs(box_height)) <= 1.5:
+                        cx *= width
+                        box_width *= width
+                        cy *= height
+                        box_height *= height
+                    parsed["points"] = [
+                        round((cx - box_width / 2) * scale, 2),
+                        round((cy - box_height / 2) * scale, 2),
+                        round((cx + box_width / 2) * scale, 2),
+                        round((cy + box_height / 2) * scale, 2),
+                    ]
+                else:
+                    rotation = float(item.get("rotation") or 0)
+                if math.isfinite(rotation):
+                    # CVAT's REST serializer only accepts angles in [0, 360].
+                    parsed["rotation"] = rotation % 360
+            except (TypeError, ValueError):
+                pass
+        shapes.append(parsed)
     return shapes
 
 
@@ -222,6 +270,7 @@ def annotate_image(
     lessons: list[str],
     refine: bool = True,
     exemplars: list[dict] | None = None,
+    rotated_boxes: bool = False,
 ) -> list[dict]:
     from .detect import as_detection_box, dedupe_shapes, detector_shapes, labels_needing_vision
 
@@ -231,23 +280,49 @@ def annotate_image(
     except Exception as exc:
         log_detect(exc)
     pending = labels_needing_vision(labels, detected) if detected else list(labels)
+    if rotated_boxes:
+        # Axis-aligned detector results need a vision pass to estimate their angle.
+        pending_names = {item.get("name") for item in pending}
+        pending.extend(
+            item for item in labels
+            if item.get("type") == "rectangle" and item.get("name") not in pending_names
+        )
     vision: list[dict] = []
     if pending:
         if not api_key and not detected:
             raise VisionError("No vision API key is configured.")
         if api_key:
-            vision = _ask_vision(api_key, model, image, pending, lessons, refine=False, exemplars=exemplars)
+            vision = _ask_vision(api_key, model, image, pending, lessons, refine=False, exemplars=exemplars, rotated_boxes=rotated_boxes)
             tuning = _accuracy_settings()
             if tuning["tiling"]:
                 vision = vision + accuracy.detect_tiled(
                     image,
-                    lambda tile: _ask_vision(api_key, model, tile, pending, lessons, refine=False, exemplars=exemplars),
+                    lambda tile: _ask_vision(api_key, model, tile, pending, lessons, refine=False, exemplars=exemplars, rotated_boxes=rotated_boxes),
                     tuning["tile_min_side"],
                 )
             if refine:
                 vision = [as_detection_box(shape) for shape in vision]
             if tuning["verify"]:
                 vision = accuracy.verify_boxes(image, vision, pending, _make_ask(api_key, model))
+            if rotated_boxes:
+                from .geometry import iou
+
+                for detection in detected:
+                    if detection.get("type") != "rectangle":
+                        continue
+                    candidates = [
+                        shape for shape in vision
+                        if shape.get("label") == detection.get("label")
+                        and shape.get("type") == "rectangle"
+                        and shape.get("rotation") is not None
+                    ]
+                    if candidates:
+                        match = max(
+                            candidates,
+                            key=lambda shape: iou(detection["points"], "rectangle", shape["points"], "rectangle"),
+                        )
+                        if iou(detection["points"], "rectangle", match["points"], "rectangle") >= 0.25:
+                            detection["rotation"] = match["rotation"]
     shapes = dedupe_shapes(detected + vision)
     if not refine or not shapes:
         return shapes
@@ -339,9 +414,10 @@ def _ask_vision(
     lessons: list[str],
     refine: bool = True,
     exemplars: list[dict] | None = None,
+    rotated_boxes: bool = False,
 ) -> list[dict]:
     payload, media_type, scale, width, height = prepare_image(image)
-    prompt = build_prompt(labels, lessons, width, height)
+    prompt = build_prompt(labels, lessons, width, height, rotated_boxes)
     import base64
 
     encoded = base64.b64encode(payload).decode("ascii")

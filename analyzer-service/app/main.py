@@ -53,6 +53,7 @@ class AnnotateIn(BaseModel):
     end_frame: int | None = None
     frames: str | None = None  # single images or ranges, e.g. "0-4, 9, 12-15"
     only_new: bool = False  # skip images that already have shapes, so added images are annotated alone
+    rotated_boxes: bool | None = None
 
 
 class CustomExportIn(BaseModel):
@@ -494,11 +495,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
             summary = run_annotation(
-                session, client, state, body.task_id, run, settings, shape=body.shape or "auto", scope=scope
+                session, client, state, body.task_id, run, settings, shape=body.shape or "auto", scope=scope,
+                rotated_boxes=body.rotated_boxes,
             )
         except CvatError as exc:
             run.status = "failed"
-            run.message = "CVAT refused the annotation write"
+            run.message = f"CVAT refused the annotation write ({exc.status}): {exc.detail[:1000]}"
             raise HTTPException(status_code=exc.status, detail=run.message) from exc
         return {"run_id": run.id, "status": run.status, "message": run.message, **summary}
 
@@ -887,9 +889,9 @@ def auto_annotate_new_tasks(
         session.flush()
         try:
             summary = run_annotation(session, client, state, task_id, run, settings, scope=scope)
-        except CvatError:
+        except CvatError as exc:
             run.status = "failed"
-            run.message = "CVAT refused the annotation write"
+            run.message = f"CVAT refused the annotation write ({exc.status}): {exc.detail[:1000]}"
             continue
         results.append({"task_id": task_id, "written": summary.get("written", 0), "message": summary.get("message")})
     return results
@@ -1137,6 +1139,7 @@ def run_annotation(
     detect=None,
     shape: str = "auto",
     scope: service.FrameScope | None = None,
+    rotated_boxes: bool | None = None,
 ) -> dict:
     task = client.get_task(task_id)
     in_project = task.get("project_id") == state.cvat_project_id
@@ -1159,6 +1162,9 @@ def run_annotation(
     lessons = prompt_lessons(profile, [{"items": row.items_json} for row in lesson_rows]) if state.learn_enabled else []
     labels = _annotation_labels(labels)
     spec_by_name = {item["name"]: item for item in (state.spec_json or {}).get("labels") or []}
+    if rotated_boxes is None:
+        learned_preference = (state.profile_json or {}).get("preferences") or {}
+        rotated_boxes = bool((state.spec_json or {}).get("rotated_boxes") or learned_preference.get("rotated_boxes"))
     spec_labels = []
     for item in labels:
         extra = spec_by_name.get(item["name"]) or {}
@@ -1251,7 +1257,7 @@ def run_annotation(
                 continue
             replaced_frames.add(frame)
             annotated_frames += 1
-            raw = _detect(client, settings, task_id, frame, spec_labels, detect, lessons, exemplars)
+            raw = _detect(client, settings, task_id, frame, spec_labels, detect, lessons, exemplars, rotated_boxes)
             adapted = service.shapes_for_labels(raw, spec_labels, profile)
             found += len(raw)
             matched += len(adapted)
@@ -1416,7 +1422,7 @@ def _empty_annotation_reason(labels: list[dict]) -> str:
     return "The vision agent did not find any labels that belong to this project."
 
 
-def _detect(client, settings: Settings, task_id: int, frame: int, labels: list[dict], detect, lessons: list[str] | None = None, exemplars: list[dict] | None = None) -> list[dict]:
+def _detect(client, settings: Settings, task_id: int, frame: int, labels: list[dict], detect, lessons: list[str] | None = None, exemplars: list[dict] | None = None, rotated_boxes: bool = False) -> list[dict]:
     global _detect_error
     if detect is not None:
         return detect(frame, labels)
@@ -1433,6 +1439,7 @@ def _detect(client, settings: Settings, task_id: int, frame: int, labels: list[d
             lessons or [],
             refine=settings.annotation_refine,
             exemplars=exemplars,
+            rotated_boxes=rotated_boxes,
         )
     except Exception as exc:
         _detect_error = str(exc)[:240]
@@ -1706,6 +1713,15 @@ def learn_job(session: Session, client: CvatClient, state, job: dict, settings: 
         except Exception:  # learning what a label looks like must never break saving or annotating
             logging.getLogger(__name__).exception("label memory capture failed")
         count += 1
+    if any(
+        shape.get("type") == "rectangle" and abs(float(shape.get("rotation") or 0)) > 0.01
+        for shapes in frames.values() for shape in shapes
+    ):
+        profile = dict(state.profile_json or {})
+        preferences = dict(profile.get("preferences") or {})
+        preferences["rotated_boxes"] = True
+        profile["preferences"] = preferences
+        state.profile_json = profile
     if apply_forward and frames:
         snapshots = {
             frame: service.latest_snapshot(session, state.cvat_project_id, job["id"], frame)
